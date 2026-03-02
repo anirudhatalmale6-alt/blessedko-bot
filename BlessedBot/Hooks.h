@@ -64,6 +64,10 @@ namespace Hooks {
         return -1;
     }
 
+    // Forward declarations for hook implementations (defined at bottom of file)
+    __declspec(noinline) int WINAPI hkSendImpl(SOCKET s, const char* buf, int len, int flags);
+    __declspec(noinline) int WINAPI hkRecvImpl(SOCKET s, char* buf, int len, int flags);
+
     // ---- JMP Stub Resolver ----
     // Follow JMP chains to find the real function implementation
     // wsock32.send is often: JMP dword ptr [&ws2_32.send] (FF 25)
