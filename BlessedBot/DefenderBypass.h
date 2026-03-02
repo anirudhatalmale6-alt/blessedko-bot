@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include "../Common/PatternScanner.h"
+#include "Hooks.h"
 
 // ============================================================
 // KODefender Bypass
@@ -186,8 +187,6 @@ namespace Defender {
 
         // 1. Hook APIs in KODefender's IAT
         if (hDefender) {
-            DWORD tmp;
-
             // IsDebuggerPresent
             Hooks::PatchIAT(hDefender, "KERNEL32.dll", "IsDebuggerPresent",
                 (DWORD)hkIsDebuggerPresent, (DWORD*)&oIsDebuggerPresent);
@@ -217,8 +216,5 @@ namespace Defender {
 
         return true;
     }
-
-    // Forward declaration of Hooks namespace function
-    namespace Hooks_NS = ::Hooks;
 
 } // namespace Defender

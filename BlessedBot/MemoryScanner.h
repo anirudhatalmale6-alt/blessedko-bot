@@ -34,25 +34,52 @@ namespace MemScanner {
         } offsets;
     };
 
-    // Read a value from game memory safely
-    template<typename T>
-    inline T ReadMem(DWORD address) {
+    // ---- Safe memory access helpers ----
+    // SEH (__try/__except) cannot coexist with C++ objects in the same function.
+    // These helpers are minimal functions with no C++ objects, so MSVC is happy.
+
+    inline DWORD SafeReadDword(DWORD address, DWORD fallback = 0) {
         __try {
-            return *(T*)address;
+            return *(DWORD*)address;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            return T{};
+            return fallback;
         }
     }
 
-    // Write a value to game memory safely
-    template<typename T>
-    inline bool WriteMem(DWORD address, T value) {
+    inline float SafeReadFloat(DWORD address, float fallback = 0.0f) {
+        __try {
+            return *(float*)address;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return fallback;
+        }
+    }
+
+    inline BYTE SafeReadByte(DWORD address, BYTE fallback = 0) {
+        __try {
+            return *(BYTE*)address;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return fallback;
+        }
+    }
+
+    inline WORD SafeReadWord(DWORD address, WORD fallback = 0) {
+        __try {
+            return *(WORD*)address;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return fallback;
+        }
+    }
+
+    inline bool SafeWriteDword(DWORD address, DWORD value) {
         __try {
             DWORD oldProt;
-            VirtualProtect((void*)address, sizeof(T), PAGE_EXECUTE_READWRITE, &oldProt);
-            *(T*)address = value;
-            VirtualProtect((void*)address, sizeof(T), oldProt, &oldProt);
+            VirtualProtect((void*)address, sizeof(DWORD), PAGE_EXECUTE_READWRITE, &oldProt);
+            *(DWORD*)address = value;
+            VirtualProtect((void*)address, sizeof(DWORD), oldProt, &oldProt);
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -60,58 +87,80 @@ namespace MemScanner {
         }
     }
 
-    // Read a string from game memory
-    inline std::string ReadString(DWORD address, int maxLen = 32) {
-        std::string result;
+    // Safe string read - copies into a caller-provided buffer (no C++ objects)
+    inline int SafeReadStringBuf(DWORD address, char* outBuf, int maxLen) {
         __try {
-            for (int i = 0; i < maxLen; i++) {
+            int i = 0;
+            for (; i < maxLen - 1; i++) {
                 char c = *(char*)(address + i);
                 if (c == 0) break;
-                if (c >= 32 && c <= 126) result += c;
-                else break;
+                if (c >= 32 && c <= 126)
+                    outBuf[i] = c;
+                else
+                    break;
             }
+            outBuf[i] = 0;
+            return i;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        return result;
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            outBuf[0] = 0;
+            return 0;
+        }
+    }
+
+    // ---- C++ wrappers that call the safe helpers ----
+
+    template<typename T>
+    inline T ReadMem(DWORD address) {
+        // Use IsBadReadPtr as a quick check (no SEH needed here)
+        if (IsBadReadPtr((void*)address, sizeof(T)))
+            return T{};
+        return *(T*)address;
+    }
+
+    template<typename T>
+    inline bool WriteMem(DWORD address, T value) {
+        if (IsBadWritePtr((void*)address, sizeof(T))) {
+            DWORD oldProt;
+            if (!VirtualProtect((void*)address, sizeof(T), PAGE_EXECUTE_READWRITE, &oldProt))
+                return false;
+            *(T*)address = value;
+            VirtualProtect((void*)address, sizeof(T), oldProt, &oldProt);
+            return true;
+        }
+        *(T*)address = value;
+        return true;
+    }
+
+    inline std::string ReadString(DWORD address, int maxLen = 32) {
+        char buf[256] = {};
+        if (maxLen > 255) maxLen = 255;
+        SafeReadStringBuf(address, buf, maxLen);
+        return std::string(buf);
     }
 
     // ---- RTTI-based class finder ----
-    // Find CPlayerMySelf instance by locating its RTTI type descriptor
     inline DWORD FindClassInstance(HMODULE hModule, const char* className) {
-        // Step 1: Find the RTTI type descriptor string ".?AVClassName@@"
         char rttiName[256];
         sprintf_s(rttiName, ".?AV%s@@", className);
 
         DWORD strAddr = Scanner::FindString(hModule, rttiName);
         if (!strAddr) return 0;
 
-        // Step 2: The type descriptor is at strAddr - 8 (vtable + spare)
         DWORD typeDesc = strAddr - 8;
-
-        // Step 3: Find references to the type descriptor
-        // These lead to the Complete Object Locator, which leads to the vtable
         auto refs = Scanner::FindXRefs(hModule, typeDesc);
 
-        // Step 4: For each reference, look for the vtable pointer
         for (DWORD ref : refs) {
-            // The vtable is typically 4 bytes after the COL reference
-            // The COL sits just before the vtable in memory
             DWORD potentialVtable = ref + 4;
-
-            // Step 5: Find references to this vtable - these are object instances
             auto instances = Scanner::FindXRefs(hModule, potentialVtable);
             if (!instances.empty()) {
-                // Found an instance!
-                return instances[0]; // Return the address where vtable pointer is stored
+                return instances[0];
             }
         }
-
         return 0;
     }
 
-    // ---- Known pattern-based scanner ----
-    // These patterns are based on common USKO v23xx builds
-
+    // ---- Main scanner ----
     inline ScanResult ScanAll() {
         ScanResult result = {};
         std::stringstream log;
@@ -133,12 +182,9 @@ namespace MemScanner {
         // ---- Find CPlayerMySelf ----
         log << "\n[SCAN] Searching for CPlayerMySelf...\n";
 
-        // Method 1: RTTI string search
         DWORD rttiStr = Scanner::FindString(hGame, ".?AVCPlayerMySelf@@");
         if (rttiStr) {
             log << "[FOUND] CPlayerMySelf RTTI at: 0x" << std::hex << rttiStr << "\n";
-
-            // Find xrefs to locate the global pointer
             auto xrefs = Scanner::FindXRefs(hGame, rttiStr);
             log << "[INFO] Found " << std::dec << xrefs.size() << " xrefs to RTTI\n";
         }
@@ -146,24 +192,14 @@ namespace MemScanner {
             log << "[WARN] CPlayerMySelf RTTI not found (may be in packed section)\n";
         }
 
-        // Method 2: Pattern scan for known CPlayerMySelf access patterns
-        // Common pattern: MOV ECX, [globalPtr] ; CALL CPlayerMySelf::Method
-        // In USKO, CPlayerMySelf is often accessed via a global pointer in .data section
-
-        // Scan for "CGameProcMain::MsgRecv_MyInfo_All" which accesses CPlayerMySelf
         DWORD myInfoStr = Scanner::FindString(hGame, "CGameProcMain::MsgRecv_MyInfo_All");
         if (myInfoStr) {
             log << "[FOUND] MsgRecv_MyInfo_All string at: 0x" << std::hex << myInfoStr << "\n";
             auto xrefs = Scanner::FindXRefs(hGame, myInfoStr);
             if (!xrefs.empty()) {
                 log << "[INFO] Function reference at: 0x" << std::hex << xrefs[0] << "\n";
-                // Near this function, there should be MOV ECX, [CPlayerMySelf_ptr]
             }
         }
-
-        // Method 3: Search data sections for pointer-sized values that could be CPlayerMySelf
-        // After the game loads a character, CPlayerMySelf pointer is non-null
-        // We can search for it by looking at known patterns
 
         // ---- Find CGameProcMain ----
         log << "\n[SCAN] Searching for CGameProcMain...\n";
@@ -174,10 +210,6 @@ namespace MemScanner {
 
         // ---- Find send/recv wrappers ----
         log << "\n[SCAN] Searching for packet functions...\n";
-
-        // The game typically wraps wsock32.send in its own function
-        // Pattern: PUSH flags / PUSH len / PUSH buf / PUSH socket / CALL [wsock32.send IAT]
-        // IAT address for send: 0xC53610
 
         DWORD sendIAT = KO::IAT::WS_SEND;
         auto sendRefs = Scanner::FindXRefs(hGame, sendIAT);
@@ -229,19 +261,17 @@ namespace MemScanner {
     }
 
     // ---- Live memory dump for debugging ----
-    // Dumps player-related memory around a suspected CPlayerMySelf pointer
     inline std::string DumpPlayerMemory(DWORD baseAddr) {
         std::stringstream ss;
         ss << "=== Memory dump around 0x" << std::hex << baseAddr << " ===\n\n";
 
         for (int offset = 0; offset < 0x200; offset += 4) {
-            DWORD val = ReadMem<DWORD>(baseAddr + offset);
-            float fval = ReadMem<float>(baseAddr + offset);
+            DWORD val = SafeReadDword(baseAddr + offset);
+            float fval = SafeReadFloat(baseAddr + offset);
 
             ss << "  +0x" << std::hex << offset << ": ";
             ss << "0x" << std::hex << val;
 
-            // Annotate likely values
             if (val > 0 && val < 200)
                 ss << " (could be level/nation/zone)";
             else if (val > 100 && val < 100000)
@@ -249,10 +279,9 @@ namespace MemScanner {
             else if (fval > 0.0f && fval < 10000.0f)
                 ss << " (float: " << fval << " - could be coordinate)";
 
-            // Check if it's a string
-            std::string s = ReadString(baseAddr + offset, 16);
-            if (s.length() > 2)
-                ss << " (string: \"" << s << "\")";
+            char strBuf[32] = {};
+            if (SafeReadStringBuf(baseAddr + offset, strBuf, 16) > 2)
+                ss << " (string: \"" << strBuf << "\")";
 
             ss << "\n";
         }
