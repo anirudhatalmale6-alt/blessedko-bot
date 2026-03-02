@@ -8,19 +8,24 @@
 #include "../Common/KOStructs.h"
 
 // ============================================================
-// Hooks v3 - Simplified approach
+// Hooks v4 - Hot-Patch Hooking
 //
-// On modern Windows, wsock32.send/recv are JMP stubs to ws2_32.dll:
-//   wsock32.send: FF 25 xx xx xx xx  (JMP dword ptr [ws2_32.send])
+// Both wsock32.send and recv have Microsoft hot-patch prologues:
+//   [5 bytes CC/90 padding] [8B FF = MOV EDI,EDI] [55 = PUSH EBP] ...
 //
-// Strategy:
-// 1. Resolve the real ws2_32.send/recv addresses
-// 2. Replace the wsock32 JMP stub with JMP to our hook (5-6 bytes)
-// 3. Our hook calls ws2_32.send/recv DIRECTLY via saved pointer
-// 4. NO TRAMPOLINE NEEDED - eliminates all relocation bugs
+// Hot-patch technique:
+// 1. Write JMP rel32 to our hook in the 5-byte padding BEFORE the function
+// 2. Replace MOV EDI,EDI (8B FF) with JMP SHORT -5 (EB F9) at func start
+// 3. Trampoline = MOV EDI,EDI (8B FF) + JMP to funcAddr+2
 //
-// KODefender checks the game's IAT (which still points to wsock32.send)
-// so it sees no change. We only modify wsock32's code section.
+// Key insight from debug log:
+// - wsock32.send IS ws2_32.send (forwarded export, same address 0x76796C30)
+// - wsock32.recv is its own function at 0x73581560
+// - Both start with 8B FF 55 8B EC = hot-patch prologue
+//
+// This means we can't use "call ws2_32.send as original" for send,
+// because it's the SAME function we're hooking. Hot-patch solves this
+// cleanly with a 7-byte trampoline.
 // ============================================================
 
 namespace Hooks {
@@ -28,29 +33,33 @@ namespace Hooks {
     typedef int (WINAPI* tSend)(SOCKET s, const char* buf, int len, int flags);
     typedef int (WINAPI* tRecv)(SOCKET s, char* buf, int len, int flags);
 
-    // Direct pointers to the REAL ws2_32 functions (not stubs)
-    inline tSend pRealSend = nullptr;
-    inline tRecv pRealRecv = nullptr;
+    // Original function trampolines (tiny: MOV EDI,EDI + JMP back)
+    inline tSend oSend = nullptr;
+    inline tRecv oRecv = nullptr;
 
     inline SOCKET gameSocket = INVALID_SOCKET;
 
-    // Hook target addresses (wsock32 stub locations)
-    inline DWORD wsockSendAddr = 0;
-    inline DWORD wsockRecvAddr = 0;
+    // Hooked function addresses
+    inline DWORD sendFuncAddr = 0;
+    inline DWORD recvFuncAddr = 0;
 
     // Original bytes for unhooking
-    inline uint8_t sendOrigBytes[8] = {};
-    inline uint8_t recvOrigBytes[8] = {};
-    inline int sendPatchSize = 0;
-    inline int recvPatchSize = 0;
+    inline uint8_t sendOrigPad[5] = {};   // 5 bytes before function
+    inline uint8_t sendOrigHead[2] = {};  // 2 bytes at function start (8B FF)
+    inline uint8_t recvOrigPad[5] = {};
+    inline uint8_t recvOrigHead[2] = {};
 
-    // Debug log file
+    // Trampolines (allocated executable memory)
+    inline uint8_t* sendTrampoline = nullptr;
+    inline uint8_t* recvTrampoline = nullptr;
+
+    // Debug
     inline FILE* logFile = nullptr;
+    inline char debugInfo[2048] = {};
+    inline int debugPos = 0;
 
     inline void LogToFile(const char* fmt, ...) {
-        if (!logFile) {
-            fopen_s(&logFile, "BlessedBot_debug.log", "a");
-        }
+        if (!logFile) fopen_s(&logFile, "BlessedBot_debug.log", "a");
         if (logFile) {
             va_list args;
             va_start(args, fmt);
@@ -60,24 +69,15 @@ namespace Hooks {
         }
     }
 
-    // Debug info for UI
-    inline char debugInfo[2048] = {};
-    inline int debugPos = 0;
-
     inline void DbgLog(const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);
         int written = vsnprintf(debugInfo + debugPos, sizeof(debugInfo) - debugPos, fmt, args);
         va_end(args);
         if (written > 0) debugPos += written;
-
-        // Also write to file for crash safety
         va_start(args, fmt);
         LogToFile("[HOOK] ");
-        if (logFile) {
-            vfprintf(logFile, fmt, args);
-            fflush(logFile);
-        }
+        if (logFile) { vfprintf(logFile, fmt, args); fflush(logFile); }
         va_end(args);
     }
 
@@ -96,15 +96,12 @@ namespace Hooks {
     inline PacketCallback onPacket = nullptr;
 
     inline int SendGamePacket(const uint8_t* data, int len) {
-        if (pRealSend && gameSocket != INVALID_SOCKET) {
-            return pRealSend(gameSocket, (const char*)data, len, 0);
-        }
+        if (oSend && gameSocket != INVALID_SOCKET)
+            return oSend(gameSocket, (const char*)data, len, 0);
         return -1;
     }
 
     // ---- Hook implementations ----
-    // These call ws2_32 functions DIRECTLY - no trampoline
-
     __declspec(noinline) static int WINAPI hkSendImpl(SOCKET s, const char* buf, int len, int flags) {
         if (gameSocket == INVALID_SOCKET)
             gameSocket = s;
@@ -126,13 +123,12 @@ namespace Hooks {
             if (!allow) return len;
         }
 
-        // Call the REAL ws2_32.send directly
-        return pRealSend(s, buf, len, flags);
+        // Call original via trampoline (MOV EDI,EDI + JMP to func+2)
+        return oSend(s, buf, len, flags);
     }
 
     __declspec(noinline) static int WINAPI hkRecvImpl(SOCKET s, char* buf, int len, int flags) {
-        // Call the REAL ws2_32.recv directly
-        int result = pRealRecv(s, buf, len, flags);
+        int result = oRecv(s, buf, len, flags);
 
         if (result > 0) {
             {
@@ -157,76 +153,102 @@ namespace Hooks {
     // ---- Hex dump helper ----
     inline void HexDump(DWORD addr, int count, char* out, int outSize) {
         int pos = 0;
-        for (int i = 0; i < count && pos < outSize - 4; i++) {
+        for (int i = 0; i < count && pos < outSize - 4; i++)
             pos += sprintf_s(out + pos, outSize - pos, "%02X ", *(uint8_t*)(addr + i));
-        }
     }
 
-    // ---- Resolve JMP stub to find real function ----
-    inline DWORD ResolveFunction(DWORD addr, const char* name) {
-        uint8_t* p = (uint8_t*)addr;
+    // ---- Create hot-patch trampoline ----
+    // Just 7 bytes: MOV EDI,EDI (8B FF) + JMP rel32 to funcAddr+2
+    inline uint8_t* CreateHotPatchTrampoline(DWORD funcAddr) {
+        uint8_t* tramp = (uint8_t*)VirtualAlloc(nullptr, 16,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!tramp) return nullptr;
 
-        for (int i = 0; i < 5; i++) {
-            if (p[0] == 0xFF && p[1] == 0x25) {
-                // JMP dword ptr [imm32] - indirect absolute jump
-                DWORD ptrAddr = *(DWORD*)(p + 2);
-                DWORD target = *(DWORD*)ptrAddr;
-                DbgLog("  %s: FF 25 stub -> ptr at 0x%08X -> target 0x%08X\n", name, ptrAddr, target);
-                p = (uint8_t*)target;
-                continue;
-            }
-            if (p[0] == 0xE9) {
-                // JMP rel32
-                int32_t offset = *(int32_t*)(p + 1);
-                DWORD target = (DWORD)p + 5 + offset;
-                DbgLog("  %s: E9 rel32 -> target 0x%08X\n", name, target);
-                p = (uint8_t*)target;
-                continue;
-            }
-            if (p[0] == 0xEB) {
-                // JMP rel8
-                int8_t offset = *(int8_t*)(p + 1);
-                DWORD target = (DWORD)p + 2 + offset;
-                DbgLog("  %s: EB rel8 -> target 0x%08X\n", name, target);
-                p = (uint8_t*)target;
-                continue;
-            }
-            break;
-        }
+        // MOV EDI, EDI (the original 2-byte instruction we're replacing)
+        tramp[0] = 0x8B;
+        tramp[1] = 0xFF;
 
-        return (DWORD)p;
+        // JMP to funcAddr + 2 (skip past the MOV EDI,EDI we replaced with JMP SHORT)
+        tramp[2] = 0xE9;
+        DWORD jmpTarget = funcAddr + 2;
+        *(int32_t*)(tramp + 3) = (int32_t)(jmpTarget - (DWORD)(tramp + 7));
+
+        return tramp;
     }
 
-    // ---- Write a JMP at target address ----
-    inline bool WriteJmp(DWORD targetAddr, DWORD hookAddr, uint8_t* backup, int patchSize) {
-        DWORD oldProt;
-        if (!VirtualProtect((void*)targetAddr, patchSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
-            DbgLog("  VirtualProtect failed: error %d\n", GetLastError());
+    // ---- Apply hot-patch hook ----
+    // funcAddr must point to 8B FF (MOV EDI,EDI) with 5 bytes of padding before it
+    inline bool ApplyHotPatch(DWORD funcAddr, DWORD hookAddr,
+        uint8_t* backupPad, uint8_t* backupHead, const char* name) {
+
+        uint8_t* pFunc = (uint8_t*)funcAddr;
+
+        // Verify hot-patch prologue
+        if (pFunc[0] != 0x8B || pFunc[1] != 0xFF) {
+            DbgLog("%s: NOT hot-patchable (bytes: %02X %02X, expected 8B FF)\n",
+                name, pFunc[0], pFunc[1]);
             return false;
+        }
+
+        // Check the 5 bytes before the function (should be CC or 90 padding)
+        uint8_t* pPad = pFunc - 5;
+        bool padOk = true;
+        for (int i = 0; i < 5; i++) {
+            if (pPad[i] != 0xCC && pPad[i] != 0x90 && pPad[i] != 0x00) {
+                padOk = false;
+                break;
+            }
+        }
+
+        char hexBuf[32];
+        HexDump((DWORD)pPad, 5, hexBuf, sizeof(hexBuf));
+        DbgLog("%s: padding bytes [-5]: %s (%s)\n", name, hexBuf, padOk ? "OK" : "NOT standard padding");
+
+        if (!padOk) {
+            DbgLog("%s: WARNING - padding not standard, but proceeding anyway\n", name);
         }
 
         // Backup original bytes
-        memcpy(backup, (void*)targetAddr, patchSize);
+        memcpy(backupPad, pPad, 5);
+        memcpy(backupHead, pFunc, 2);
 
-        // Write JMP rel32
-        *(uint8_t*)targetAddr = 0xE9;
-        *(int32_t*)(targetAddr + 1) = (int32_t)(hookAddr - (targetAddr + 5));
+        // Step 1: Write JMP rel32 to our hook in the 5-byte padding area
+        DWORD oldProt;
+        if (!VirtualProtect(pPad, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            DbgLog("%s: VirtualProtect failed: %d\n", name, GetLastError());
+            return false;
+        }
 
-        // NOP remaining bytes
-        for (int i = 5; i < patchSize; i++)
-            *(uint8_t*)(targetAddr + i) = 0x90;
+        // JMP rel32 at funcAddr-5
+        pPad[0] = 0xE9;
+        *(int32_t*)(pPad + 1) = (int32_t)(hookAddr - (DWORD)(pPad + 5));
 
-        VirtualProtect((void*)targetAddr, patchSize, oldProt, &oldProt);
+        // Step 2: Replace MOV EDI,EDI with JMP SHORT -5 (jumps to the JMP we just wrote)
+        pFunc[0] = 0xEB;  // JMP SHORT
+        pFunc[1] = 0xF9;  // -7 (relative to next instruction at pFunc+2, target = pFunc+2-7 = pFunc-5)
+
+        VirtualProtect(pPad, 7, oldProt, &oldProt);
+
+        // Verify
+        HexDump((DWORD)pPad, 7, hexBuf, sizeof(hexBuf));
+        DbgLog("%s: patched [-5..+2]: %s\n", name, hexBuf);
+
         return true;
     }
 
-    // ---- Restore original bytes ----
-    inline bool RestoreBytes(DWORD targetAddr, uint8_t* backup, int patchSize) {
+    // ---- Restore hot-patch ----
+    inline bool RestoreHotPatch(DWORD funcAddr, uint8_t* backupPad, uint8_t* backupHead) {
+        uint8_t* pFunc = (uint8_t*)funcAddr;
+        uint8_t* pPad = pFunc - 5;
+
         DWORD oldProt;
-        if (!VirtualProtect((void*)targetAddr, patchSize, PAGE_EXECUTE_READWRITE, &oldProt))
+        if (!VirtualProtect(pPad, 7, PAGE_EXECUTE_READWRITE, &oldProt))
             return false;
-        memcpy((void*)targetAddr, backup, patchSize);
-        VirtualProtect((void*)targetAddr, patchSize, oldProt, &oldProt);
+
+        memcpy(pPad, backupPad, 5);
+        memcpy(pFunc, backupHead, 2);
+
+        VirtualProtect(pPad, 7, oldProt, &oldProt);
         return true;
     }
 
@@ -235,139 +257,88 @@ namespace Hooks {
         debugPos = 0;
         memset(debugInfo, 0, sizeof(debugInfo));
 
-        DbgLog("=== Hook Install v3 ===\n");
+        DbgLog("=== Hook Install v4 (Hot-Patch) ===\n");
 
-        // Step 1: Get wsock32 module
+        // Get module handles
         HMODULE hWsock = GetModuleHandleA("wsock32.dll");
         if (!hWsock) hWsock = LoadLibraryA("wsock32.dll");
-        if (!hWsock) {
-            DbgLog("FAIL: wsock32.dll not found\n");
-            return false;
-        }
-        DbgLog("wsock32.dll at: 0x%08X\n", (DWORD)hWsock);
-
-        // Also get ws2_32 module
         HMODULE hWs2 = GetModuleHandleA("ws2_32.dll");
         if (!hWs2) hWs2 = LoadLibraryA("ws2_32.dll");
+
+        if (!hWsock) { DbgLog("FAIL: wsock32.dll not found\n"); return false; }
+
+        DbgLog("wsock32.dll at: 0x%08X\n", (DWORD)hWsock);
         DbgLog("ws2_32.dll at: 0x%08X\n", (DWORD)hWs2);
 
-        // Step 2: Get wsock32 export addresses
-        wsockSendAddr = (DWORD)GetProcAddress(hWsock, "send");
-        wsockRecvAddr = (DWORD)GetProcAddress(hWsock, "recv");
+        // Get export addresses
+        DWORD wsockSend = (DWORD)GetProcAddress(hWsock, "send");
+        DWORD wsockRecv = (DWORD)GetProcAddress(hWsock, "recv");
+        DWORD ws2Send = hWs2 ? (DWORD)GetProcAddress(hWs2, "send") : 0;
+        DWORD ws2Recv = hWs2 ? (DWORD)GetProcAddress(hWs2, "recv") : 0;
 
-        if (!wsockSendAddr || !wsockRecvAddr) {
-            DbgLog("FAIL: GetProcAddress failed\n");
+        char hexBuf[128];
+
+        HexDump(wsockSend, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("wsock32.send (0x%08X): %s\n", wsockSend, hexBuf);
+        HexDump(wsockRecv, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("wsock32.recv (0x%08X): %s\n", wsockRecv, hexBuf);
+
+        if (ws2Send) {
+            HexDump(ws2Send, 16, hexBuf, sizeof(hexBuf));
+            DbgLog("ws2_32.send (0x%08X): %s\n", ws2Send, hexBuf);
+        }
+        if (ws2Recv) {
+            HexDump(ws2Recv, 16, hexBuf, sizeof(hexBuf));
+            DbgLog("ws2_32.recv (0x%08X): %s\n", ws2Recv, hexBuf);
+        }
+
+        DbgLog("wsock32.send == ws2_32.send? %s\n", wsockSend == ws2Send ? "YES (forwarded)" : "NO");
+        DbgLog("wsock32.recv == ws2_32.recv? %s\n", wsockRecv == ws2Recv ? "YES (forwarded)" : "NO");
+
+        // Determine which addresses to hook
+        // For send: wsock32.send IS ws2_32.send (forwarded export), hook at that address
+        // For recv: wsock32.recv is different, hook wsock32.recv
+        // (game calls wsock32, so we hook what the game actually calls)
+        sendFuncAddr = wsockSend;
+        recvFuncAddr = wsockRecv;
+
+        DbgLog("\nHooking send at: 0x%08X\n", sendFuncAddr);
+        DbgLog("Hooking recv at: 0x%08X\n", recvFuncAddr);
+
+        // Create trampolines (MOV EDI,EDI + JMP to func+2)
+        sendTrampoline = CreateHotPatchTrampoline(sendFuncAddr);
+        recvTrampoline = CreateHotPatchTrampoline(recvFuncAddr);
+
+        if (!sendTrampoline || !recvTrampoline) {
+            DbgLog("FAIL: Could not allocate trampolines\n");
             return false;
         }
 
-        // Dump raw bytes
-        char hexBuf[128];
-        HexDump(wsockSendAddr, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("wsock32.send (0x%08X): %s\n", wsockSendAddr, hexBuf);
-        HexDump(wsockRecvAddr, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("wsock32.recv (0x%08X): %s\n", wsockRecvAddr, hexBuf);
+        oSend = (tSend)sendTrampoline;
+        oRecv = (tRecv)recvTrampoline;
 
-        // Step 3: Resolve to real ws2_32 functions
-        DbgLog("Resolving JMP stubs...\n");
-        DWORD realSend = ResolveFunction(wsockSendAddr, "send");
-        DWORD realRecv = ResolveFunction(wsockRecvAddr, "recv");
+        DbgLog("send trampoline at: 0x%08X\n", (DWORD)sendTrampoline);
+        DbgLog("recv trampoline at: 0x%08X\n", (DWORD)recvTrampoline);
 
-        HexDump(realSend, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("Real send (0x%08X): %s\n", realSend, hexBuf);
-        HexDump(realRecv, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("Real recv (0x%08X): %s\n", realRecv, hexBuf);
+        // Verify trampolines
+        HexDump((DWORD)sendTrampoline, 7, hexBuf, sizeof(hexBuf));
+        DbgLog("send trampoline bytes: %s\n", hexBuf);
+        HexDump((DWORD)recvTrampoline, 7, hexBuf, sizeof(hexBuf));
+        DbgLog("recv trampoline bytes: %s\n", hexBuf);
 
-        // Also try getting ws2_32 exports directly for comparison
-        if (hWs2) {
-            DWORD ws2Send = (DWORD)GetProcAddress(hWs2, "send");
-            DWORD ws2Recv = (DWORD)GetProcAddress(hWs2, "recv");
-            DbgLog("ws2_32.send direct: 0x%08X (match: %s)\n", ws2Send,
-                ws2Send == realSend ? "YES" : "NO");
-            DbgLog("ws2_32.recv direct: 0x%08X (match: %s)\n", ws2Recv,
-                ws2Recv == realRecv ? "YES" : "NO");
-        }
-
-        // Step 4: Save real function pointers
-        pRealSend = (tSend)realSend;
-        pRealRecv = (tRecv)realRecv;
-
-        // Step 5: Determine patch size for the wsock32 stubs
-        // FF 25 stubs are 6 bytes, E9 stubs are 5 bytes
-        uint8_t* pSend = (uint8_t*)wsockSendAddr;
-        uint8_t* pRecv = (uint8_t*)wsockRecvAddr;
-
-        if (pSend[0] == 0xFF && pSend[1] == 0x25) {
-            sendPatchSize = 6;  // FF 25 xx xx xx xx
-            DbgLog("send stub: FF 25 indirect JMP (6 bytes)\n");
-        }
-        else if (pSend[0] == 0xE9) {
-            sendPatchSize = 5;  // E9 xx xx xx xx
-            DbgLog("send stub: E9 relative JMP (5 bytes)\n");
-        }
-        else {
-            // Not a stub - it's the real function. Hook it directly.
-            // Need at least 5 bytes. Assume standard prologue.
-            sendPatchSize = 5;
-            DbgLog("send: NOT a stub, hooking directly (5 bytes)\n");
-            // In this case, we can't just call pRealSend - we need a trampoline
-            // For now, try to use ws2_32.send directly
-            if (hWs2) {
-                DWORD ws2Send = (DWORD)GetProcAddress(hWs2, "send");
-                if (ws2Send && ws2Send != wsockSendAddr) {
-                    pRealSend = (tSend)ws2Send;
-                    DbgLog("  Using ws2_32.send (0x%08X) as original\n", ws2Send);
-                }
-                else {
-                    DbgLog("  WARNING: Cannot find alternate send - may crash!\n");
-                }
-            }
-        }
-
-        if (pRecv[0] == 0xFF && pRecv[1] == 0x25) {
-            recvPatchSize = 6;
-            DbgLog("recv stub: FF 25 indirect JMP (6 bytes)\n");
-        }
-        else if (pRecv[0] == 0xE9) {
-            recvPatchSize = 5;
-            DbgLog("recv stub: E9 relative JMP (5 bytes)\n");
-        }
-        else {
-            recvPatchSize = 5;
-            DbgLog("recv: NOT a stub, hooking directly (5 bytes)\n");
-            if (hWs2) {
-                DWORD ws2Recv = (DWORD)GetProcAddress(hWs2, "recv");
-                if (ws2Recv && ws2Recv != wsockRecvAddr) {
-                    pRealRecv = (tRecv)ws2Recv;
-                    DbgLog("  Using ws2_32.recv (0x%08X) as original\n", ws2Recv);
-                }
-            }
-        }
-
-        // Step 6: Get our hook function addresses
+        // Get hook function addresses
         DWORD hookSendAddr = (DWORD)&hkSendImpl;
         DWORD hookRecvAddr = (DWORD)&hkRecvImpl;
         DbgLog("hkSendImpl at: 0x%08X\n", hookSendAddr);
         DbgLog("hkRecvImpl at: 0x%08X\n", hookRecvAddr);
 
-        // Step 7: Write the JMP hooks
-        DbgLog("Writing hooks...\n");
+        // Apply hot-patches
+        DbgLog("\nApplying hot-patches...\n");
 
-        bool sendOk = WriteJmp(wsockSendAddr, hookSendAddr, sendOrigBytes, sendPatchSize);
-        DbgLog("send hook: %s\n", sendOk ? "OK" : "FAIL");
+        bool sendOk = ApplyHotPatch(sendFuncAddr, hookSendAddr, sendOrigPad, sendOrigHead, "send");
+        bool recvOk = ApplyHotPatch(recvFuncAddr, hookRecvAddr, recvOrigPad, recvOrigHead, "recv");
 
-        bool recvOk = WriteJmp(wsockRecvAddr, hookRecvAddr, recvOrigBytes, recvPatchSize);
-        DbgLog("recv hook: %s\n", recvOk ? "OK" : "FAIL");
-
-        // Verify the patch
-        if (sendOk) {
-            HexDump(wsockSendAddr, 8, hexBuf, sizeof(hexBuf));
-            DbgLog("send after patch: %s\n", hexBuf);
-        }
-        if (recvOk) {
-            HexDump(wsockRecvAddr, 8, hexBuf, sizeof(hexBuf));
-            DbgLog("recv after patch: %s\n", hexBuf);
-        }
-
+        DbgLog("\nResult: send=%s recv=%s\n", sendOk ? "OK" : "FAIL", recvOk ? "OK" : "FAIL");
         DbgLog("=== Hook Install Complete ===\n");
 
         return sendOk && recvOk;
@@ -375,12 +346,14 @@ namespace Hooks {
 
     // ---- Remove Hooks ----
     inline void RemoveNetworkHooks() {
-        if (wsockSendAddr && sendPatchSize > 0)
-            RestoreBytes(wsockSendAddr, sendOrigBytes, sendPatchSize);
-        if (wsockRecvAddr && recvPatchSize > 0)
-            RestoreBytes(wsockRecvAddr, recvOrigBytes, recvPatchSize);
-        pRealSend = nullptr;
-        pRealRecv = nullptr;
+        if (sendFuncAddr)
+            RestoreHotPatch(sendFuncAddr, sendOrigPad, sendOrigHead);
+        if (recvFuncAddr)
+            RestoreHotPatch(recvFuncAddr, recvOrigPad, recvOrigHead);
+        if (sendTrampoline) { VirtualFree(sendTrampoline, 0, MEM_RELEASE); sendTrampoline = nullptr; }
+        if (recvTrampoline) { VirtualFree(recvTrampoline, 0, MEM_RELEASE); recvTrampoline = nullptr; }
+        oSend = nullptr;
+        oRecv = nullptr;
         if (logFile) { fclose(logFile); logFile = nullptr; }
     }
 
