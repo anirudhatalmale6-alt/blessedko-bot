@@ -46,34 +46,59 @@ void OnHookClick() {
         return;
     }
 
-    BotUI::Log("[*] Installing network hooks (inline detour)...");
-
-    char buf[256];
-
-    HMODULE hWsock = GetModuleHandleA("wsock32.dll");
-    if (hWsock) {
-        DWORD sendAddr = (DWORD)GetProcAddress(hWsock, "send");
-        DWORD recvAddr = (DWORD)GetProcAddress(hWsock, "recv");
-        sprintf_s(buf, "[*] wsock32.send at: 0x%08X", sendAddr);
-        BotUI::Log(buf);
-        sprintf_s(buf, "[*] wsock32.recv at: 0x%08X", recvAddr);
-        BotUI::Log(buf);
-    }
+    BotUI::Log("[*] Installing network hooks (inline detour v2)...");
+    BotUI::Log("[*] Resolving JMP stubs and hooking real functions...");
 
     if (Hooks::InstallNetworkHooks()) {
         g_hooksInstalled = true;
-        sprintf_s(buf, "[+] send() detoured (%d bytes stolen, trampoline at 0x%08X)",
-            Hooks::sendStolenBytes, (DWORD)Hooks::sendTrampoline);
-        BotUI::Log(buf);
-        sprintf_s(buf, "[+] recv() detoured (%d bytes stolen, trampoline at 0x%08X)",
-            Hooks::recvStolenBytes, (DWORD)Hooks::recvTrampoline);
-        BotUI::Log(buf);
-        BotUI::Log("[+] IAT entries untouched - KODefender checksum safe");
-        BotUI::SetStatus("Status: Hooks active (inline)");
+
+        // Show detailed debug info from the hook engine
+        // Split debugInfo by newlines and log each line
+        char* line = Hooks::debugInfo;
+        while (*line) {
+            char* nl = strchr(line, '\n');
+            if (nl) {
+                *nl = 0;
+                char logLine[512];
+                sprintf_s(logLine, "[*] %s", line);
+                BotUI::Log(logLine);
+                *nl = '\n';
+                line = nl + 1;
+            }
+            else {
+                char logLine[512];
+                sprintf_s(logLine, "[*] %s", line);
+                BotUI::Log(logLine);
+                break;
+            }
+        }
+
+        BotUI::Log("[+] Network hooks installed successfully!");
+        BotUI::Log("[+] IAT entries untouched - KODefender safe");
+        BotUI::SetStatus("Status: Hooks active (detour v2)");
     }
     else {
         BotUI::Log("[-] Failed to install inline hooks!");
-        BotUI::Log("    Try: Make sure wsock32.dll is loaded (past login screen)");
+        // Still show debug info for diagnostics
+        char* line = Hooks::debugInfo;
+        while (*line) {
+            char* nl = strchr(line, '\n');
+            if (nl) {
+                *nl = 0;
+                char logLine[512];
+                sprintf_s(logLine, "[-] %s", line);
+                BotUI::Log(logLine);
+                *nl = '\n';
+                line = nl + 1;
+            }
+            else {
+                char logLine[512];
+                sprintf_s(logLine, "[-] %s", line);
+                BotUI::Log(logLine);
+                break;
+            }
+        }
+        BotUI::Log("    Send the screenshot of these logs to me for debugging!");
     }
 }
 
