@@ -4,44 +4,82 @@
 #include <vector>
 #include <mutex>
 #include <functional>
+#include <cstdio>
 #include "../Common/KOStructs.h"
 
 // ============================================================
-// Hooks - Inline detour hooking for send/recv (v2)
-// + IAT patching (kept for KODefender bypass use)
+// Hooks v3 - Simplified approach
 //
-// v2 fixes:
-// - Follows JMP stubs (wsock32 → ws2_32) to find real function
-// - Hooks the actual ws2_32 implementation, not the wsock32 stub
-// - Relocates relative JMP/CALL instructions in trampoline
-// - Non-inline hook functions for stable addresses
-// - Dumps function prologue bytes for debugging
+// On modern Windows, wsock32.send/recv are JMP stubs to ws2_32.dll:
+//   wsock32.send: FF 25 xx xx xx xx  (JMP dword ptr [ws2_32.send])
+//
+// Strategy:
+// 1. Resolve the real ws2_32.send/recv addresses
+// 2. Replace the wsock32 JMP stub with JMP to our hook (5-6 bytes)
+// 3. Our hook calls ws2_32.send/recv DIRECTLY via saved pointer
+// 4. NO TRAMPOLINE NEEDED - eliminates all relocation bugs
+//
+// KODefender checks the game's IAT (which still points to wsock32.send)
+// so it sees no change. We only modify wsock32's code section.
 // ============================================================
 
 namespace Hooks {
 
-    // Original function pointers (trampolines)
     typedef int (WINAPI* tSend)(SOCKET s, const char* buf, int len, int flags);
     typedef int (WINAPI* tRecv)(SOCKET s, char* buf, int len, int flags);
 
-    inline tSend oSend = nullptr;
-    inline tRecv oRecv = nullptr;
+    // Direct pointers to the REAL ws2_32 functions (not stubs)
+    inline tSend pRealSend = nullptr;
+    inline tRecv pRealRecv = nullptr;
+
     inline SOCKET gameSocket = INVALID_SOCKET;
 
-    // Trampoline storage
-    inline uint8_t* sendTrampoline = nullptr;
-    inline uint8_t* recvTrampoline = nullptr;
+    // Hook target addresses (wsock32 stub locations)
+    inline DWORD wsockSendAddr = 0;
+    inline DWORD wsockRecvAddr = 0;
 
     // Original bytes for unhooking
-    inline uint8_t sendOrigBytes[32] = {};
-    inline uint8_t recvOrigBytes[32] = {};
-    inline DWORD sendFuncAddr = 0;
-    inline DWORD recvFuncAddr = 0;
-    inline int sendStolenBytes = 0;
-    inline int recvStolenBytes = 0;
+    inline uint8_t sendOrigBytes[8] = {};
+    inline uint8_t recvOrigBytes[8] = {};
+    inline int sendPatchSize = 0;
+    inline int recvPatchSize = 0;
 
-    // Debug info string (shown in UI)
-    inline char debugInfo[1024] = {};
+    // Debug log file
+    inline FILE* logFile = nullptr;
+
+    inline void LogToFile(const char* fmt, ...) {
+        if (!logFile) {
+            fopen_s(&logFile, "BlessedBot_debug.log", "a");
+        }
+        if (logFile) {
+            va_list args;
+            va_start(args, fmt);
+            vfprintf(logFile, fmt, args);
+            va_end(args);
+            fflush(logFile);
+        }
+    }
+
+    // Debug info for UI
+    inline char debugInfo[2048] = {};
+    inline int debugPos = 0;
+
+    inline void DbgLog(const char* fmt, ...) {
+        va_list args;
+        va_start(args, fmt);
+        int written = vsnprintf(debugInfo + debugPos, sizeof(debugInfo) - debugPos, fmt, args);
+        va_end(args);
+        if (written > 0) debugPos += written;
+
+        // Also write to file for crash safety
+        va_start(args, fmt);
+        LogToFile("[HOOK] ");
+        if (logFile) {
+            vfprintf(logFile, fmt, args);
+            fflush(logFile);
+        }
+        va_end(args);
+    }
 
     // Packet log
     struct PacketLog {
@@ -58,433 +96,292 @@ namespace Hooks {
     inline PacketCallback onPacket = nullptr;
 
     inline int SendGamePacket(const uint8_t* data, int len) {
-        if (oSend && gameSocket != INVALID_SOCKET) {
-            return oSend(gameSocket, (const char*)data, len, 0);
+        if (pRealSend && gameSocket != INVALID_SOCKET) {
+            return pRealSend(gameSocket, (const char*)data, len, 0);
         }
         return -1;
     }
 
-    // Forward declarations for hook implementations (defined at bottom of file)
-    __declspec(noinline) int WINAPI hkSendImpl(SOCKET s, const char* buf, int len, int flags);
-    __declspec(noinline) int WINAPI hkRecvImpl(SOCKET s, char* buf, int len, int flags);
+    // ---- Hook implementations ----
+    // These call ws2_32 functions DIRECTLY - no trampoline
 
-    // ---- JMP Stub Resolver ----
-    // Follow JMP chains to find the real function implementation
-    // wsock32.send is often: JMP dword ptr [&ws2_32.send] (FF 25)
-    // or: JMP rel32 to ws2_32.send (E9)
-    inline DWORD ResolveFunction(DWORD addr) {
-        uint8_t* p = (uint8_t*)addr;
+    __declspec(noinline) static int WINAPI hkSendImpl(SOCKET s, const char* buf, int len, int flags) {
+        if (gameSocket == INVALID_SOCKET)
+            gameSocket = s;
 
-        // Follow up to 5 jumps (safety limit)
-        for (int i = 0; i < 5; i++) {
-            if (p[0] == 0xFF && p[1] == 0x25) {
-                // JMP dword ptr [imm32] - indirect jump
-                DWORD* pTarget = (DWORD*)(*(DWORD*)(p + 2));
-                p = (uint8_t*)*pTarget;
-                continue;
-            }
-            if (p[0] == 0xE9) {
-                // JMP rel32 - relative jump
-                int32_t offset = *(int32_t*)(p + 1);
-                p = p + 5 + offset;
-                continue;
-            }
-            if (p[0] == 0xEB) {
-                // JMP rel8 - short jump
-                int8_t offset = *(int8_t*)(p + 1);
-                p = p + 2 + offset;
-                continue;
-            }
-            // Not a JMP - this is the real function
-            break;
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            PacketLog entry;
+            entry.isSend = true;
+            entry.timestamp = GetTickCount();
+            if (len > 0 && buf)
+                entry.data.assign((uint8_t*)buf, (uint8_t*)buf + len);
+            packetLog.push_back(entry);
+            if (packetLog.size() > MAX_LOG_SIZE)
+                packetLog.erase(packetLog.begin());
         }
 
-        return (DWORD)p;
+        if (onPacket) {
+            bool allow = onPacket(true, (const uint8_t*)buf, len);
+            if (!allow) return len;
+        }
+
+        // Call the REAL ws2_32.send directly
+        return pRealSend(s, buf, len, flags);
     }
 
-    // ---- x86 Instruction Length Calculator ----
-    // Handles common prologues found in ws2_32 functions
-    inline int GetInstructionLength(uint8_t* addr) {
-        uint8_t op = *addr;
+    __declspec(noinline) static int WINAPI hkRecvImpl(SOCKET s, char* buf, int len, int flags) {
+        // Call the REAL ws2_32.recv directly
+        int result = pRealRecv(s, buf, len, flags);
 
-        // Handle 2-byte opcodes (0x0F prefix)
-        if (op == 0x0F) {
-            uint8_t op2 = *(addr + 1);
-            // Common 0F xx patterns:
-            if (op2 >= 0x80 && op2 <= 0x8F) return 6;  // Jcc rel32
-            if (op2 == 0x1F) {  // NOP with ModR/M (multi-byte NOP)
-                uint8_t modrm = *(addr + 2);
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t rm = modrm & 7;
-                if (mod == 0 && rm == 0) return 3;       // 0F 1F 00
-                if (mod == 1 && rm == 0) return 4;       // 0F 1F 40 xx
-                if (mod == 1 && rm == 4) return 5;       // 0F 1F 44 xx xx
-                if (mod == 2 && rm == 0) return 7;       // 0F 1F 80 xx xx xx xx
-                if (mod == 2 && rm == 4) return 8;       // 0F 1F 84 xx xx xx xx xx
-                return 3;  // safe fallback for NOP variants
-            }
-            if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF) {
-                // MOVZX / MOVSX
-                uint8_t modrm = *(addr + 2);
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t rm = modrm & 7;
-                if (mod == 3) return 3;
-                if (mod == 0) return (rm == 4) ? 4 : (rm == 5) ? 7 : 3;
-                if (mod == 1) return (rm == 4) ? 5 : 4;
-                if (mod == 2) return (rm == 4) ? 8 : 7;
-                return 3;
-            }
-            return 2;  // fallback for unknown 0F xx
-        }
-
-        // Handle 66 prefix (operand size override)
-        if (op == 0x66) {
-            // Recurse on the actual opcode, add 1 for prefix
-            int innerLen = GetInstructionLength(addr + 1);
-            return 1 + innerLen;
-        }
-
-        switch (op) {
-            case 0x55: return 1; // PUSH EBP
-            case 0x56: return 1; // PUSH ESI
-            case 0x57: return 1; // PUSH EDI
-            case 0x53: return 1; // PUSH EBX
-            case 0x50: return 1; // PUSH EAX
-            case 0x51: return 1; // PUSH ECX
-            case 0x52: return 1; // PUSH EDX
-            case 0x54: return 1; // PUSH ESP
-            case 0x5D: return 1; // POP EBP
-            case 0x5E: return 1; // POP ESI
-            case 0x5F: return 1; // POP EDI
-            case 0x5B: return 1; // POP EBX
-            case 0x58: return 1; // POP EAX
-            case 0x59: return 1; // POP ECX
-            case 0x5A: return 1; // POP EDX
-            case 0x90: return 1; // NOP
-            case 0xC3: return 1; // RET
-            case 0xCC: return 1; // INT3
-            case 0xC9: return 1; // LEAVE
-            case 0xF8: return 1; // CLC
-            case 0xF9: return 1; // STC
-            case 0xFC: return 1; // CLD
-            case 0xFD: return 1; // STD
-
-            case 0xC2: return 3; // RET imm16
-            case 0xEB: return 2; // JMP rel8
-            case 0xE9: return 5; // JMP rel32
-            case 0xE8: return 5; // CALL rel32
-            case 0xA1: return 5; // MOV EAX, [imm32]
-            case 0xA3: return 5; // MOV [imm32], EAX
-
-            case 0xB8: case 0xB9: case 0xBA: case 0xBB:
-            case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-                return 5; // MOV r32, imm32
-
-            case 0xB0: case 0xB1: case 0xB2: case 0xB3:
-            case 0xB4: case 0xB5: case 0xB6: case 0xB7:
-                return 2; // MOV r8, imm8
-
-            case 0x68: return 5; // PUSH imm32
-            case 0x6A: return 2; // PUSH imm8
-
-            case 0x04: case 0x0C: case 0x14: case 0x1C:
-            case 0x24: case 0x2C: case 0x34: case 0x3C:
-            case 0xA8:
-                return 2; // ALU AL, imm8 / TEST AL, imm8
-
-            case 0x05: case 0x0D: case 0x15: case 0x1D:
-            case 0x25: case 0x2D: case 0x35: case 0x3D:
-            case 0xA9:
-                return 5; // ALU EAX, imm32 / TEST EAX, imm32
-
-            // Short conditional jumps
-            case 0x70: case 0x71: case 0x72: case 0x73:
-            case 0x74: case 0x75: case 0x76: case 0x77:
-            case 0x78: case 0x79: case 0x7A: case 0x7B:
-            case 0x7C: case 0x7D: case 0x7E: case 0x7F:
-                return 2;
-
-            case 0x80: return 3; // ALU r/m8, imm8
-            case 0x83: return 3; // ALU r/m32, imm8
-            case 0x81: return 6; // ALU r/m32, imm32
-            case 0xC6: return 3; // MOV r/m8, imm8 (simple ModRM)
-            case 0xC7: {          // MOV r/m32, imm32
-                uint8_t modrm = *(addr + 1);
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t rm = modrm & 7;
-                int base = 2 + 4; // opcode + modrm + imm32
-                if (mod == 3) return base;
-                if (mod == 0) {
-                    if (rm == 5) return base + 4;  // [disp32]
-                    if (rm == 4) return base + 1;  // [SIB]
-                    return base;
-                }
-                if (mod == 1) return base + 1 + (rm == 4 ? 1 : 0); // [reg+disp8] or [SIB+disp8]
-                if (mod == 2) return base + 4 + (rm == 4 ? 1 : 0); // [reg+disp32]
-                return base;
-            }
-
-            // ModR/M based opcodes (2+ bytes)
-            case 0x00: case 0x01: case 0x02: case 0x03: // ADD
-            case 0x08: case 0x09: case 0x0A: case 0x0B: // OR
-            case 0x10: case 0x11: case 0x12: case 0x13: // ADC
-            case 0x18: case 0x19: case 0x1A: case 0x1B: // SBB
-            case 0x20: case 0x21: case 0x22: case 0x23: // AND
-            case 0x28: case 0x29: case 0x2A: case 0x2B: // SUB
-            case 0x30: case 0x31: case 0x32: case 0x33: // XOR
-            case 0x38: case 0x39: case 0x3A: case 0x3B: // CMP
-            case 0x84: case 0x85:                        // TEST
-            case 0x86: case 0x87:                        // XCHG
-            case 0x88: case 0x89: case 0x8A: case 0x8B: // MOV
-            case 0x8D:                                   // LEA
-            case 0xD1: case 0xD3:                        // shift/rotate
-            case 0xF6: case 0xF7:                        // TEST/NOT/NEG/MUL/DIV
-            case 0xFE: case 0xFF:                        // INC/DEC/CALL/JMP/PUSH
+        if (result > 0) {
             {
-                uint8_t modrm = *(addr + 1);
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t rm = modrm & 7;
-
-                int len = 2; // opcode + modrm
-                if (mod == 3) return len;
-                if (rm == 4 && mod != 3) len++; // SIB byte
-                if (mod == 0 && rm == 5) len += 4; // [disp32]
-                else if (mod == 1) len += 1; // disp8
-                else if (mod == 2) len += 4; // disp32
-
-                // F6/F7 with reg=0 (TEST) has immediate
-                if ((op == 0xF6) && ((modrm >> 3) & 7) == 0) len += 1;
-                if ((op == 0xF7) && ((modrm >> 3) & 7) == 0) len += 4;
-
-                return len;
+                std::lock_guard<std::mutex> lock(logMutex);
+                PacketLog entry;
+                entry.isSend = false;
+                entry.timestamp = GetTickCount();
+                entry.data.assign((uint8_t*)buf, (uint8_t*)buf + result);
+                packetLog.push_back(entry);
+                if (packetLog.size() > MAX_LOG_SIZE)
+                    packetLog.erase(packetLog.begin());
             }
 
-            default:
-                return 0; // UNKNOWN - signal error
-        }
-    }
-
-    // ---- Trampoline Builder (with relocation) ----
-    inline uint8_t* CreateTrampoline(uint8_t* targetFunc, int& stolenBytes, char* dbgBuf, int dbgBufSize) {
-        stolenBytes = 0;
-        int maxAttempt = 32; // safety limit
-
-        // Calculate stolen bytes
-        while (stolenBytes < 5 && maxAttempt-- > 0) {
-            int len = GetInstructionLength(targetFunc + stolenBytes);
-            if (len <= 0) {
-                // Unknown instruction - dump bytes for debugging
-                sprintf_s(dbgBuf, dbgBufSize,
-                    "Unknown instruction at offset %d: %02X %02X %02X %02X",
-                    stolenBytes,
-                    targetFunc[stolenBytes], targetFunc[stolenBytes + 1],
-                    targetFunc[stolenBytes + 2], targetFunc[stolenBytes + 3]);
-                return nullptr;
-            }
-            stolenBytes += len;
-        }
-
-        if (stolenBytes < 5) {
-            sprintf_s(dbgBuf, dbgBufSize, "Could not find enough bytes to steal (got %d, need 5)", stolenBytes);
-            return nullptr;
-        }
-
-        // Allocate executable memory for trampoline (generously sized)
-        int trampolineSize = stolenBytes + 32; // extra room for relocations
-        uint8_t* trampoline = (uint8_t*)VirtualAlloc(nullptr, 64,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!trampoline) {
-            sprintf_s(dbgBuf, dbgBufSize, "VirtualAlloc failed for trampoline");
-            return nullptr;
-        }
-
-        // Copy stolen bytes, relocating relative JMP/CALL instructions
-        int srcOff = 0;
-        int dstOff = 0;
-        while (srcOff < stolenBytes) {
-            uint8_t op = targetFunc[srcOff];
-
-            if (op == 0xE9) {
-                // JMP rel32 - relocate
-                int32_t origRel = *(int32_t*)(targetFunc + srcOff + 1);
-                DWORD origTarget = (DWORD)(targetFunc + srcOff + 5) + origRel;
-                trampoline[dstOff] = 0xE9;
-                *(int32_t*)(trampoline + dstOff + 1) =
-                    (int32_t)(origTarget - (DWORD)(trampoline + dstOff + 5));
-                srcOff += 5;
-                dstOff += 5;
-            }
-            else if (op == 0xE8) {
-                // CALL rel32 - relocate
-                int32_t origRel = *(int32_t*)(targetFunc + srcOff + 1);
-                DWORD origTarget = (DWORD)(targetFunc + srcOff + 5) + origRel;
-                trampoline[dstOff] = 0xE8;
-                *(int32_t*)(trampoline + dstOff + 1) =
-                    (int32_t)(origTarget - (DWORD)(trampoline + dstOff + 5));
-                srcOff += 5;
-                dstOff += 5;
-            }
-            else if (op == 0xEB) {
-                // JMP rel8 - convert to JMP rel32 for safety
-                int8_t origRel = *(int8_t*)(targetFunc + srcOff + 1);
-                DWORD origTarget = (DWORD)(targetFunc + srcOff + 2) + origRel;
-                trampoline[dstOff] = 0xE9;
-                *(int32_t*)(trampoline + dstOff + 1) =
-                    (int32_t)(origTarget - (DWORD)(trampoline + dstOff + 5));
-                srcOff += 2;
-                dstOff += 5;
-            }
-            else {
-                // Regular instruction - copy as-is
-                int len = GetInstructionLength(targetFunc + srcOff);
-                if (len <= 0) len = 1;
-                memcpy(trampoline + dstOff, targetFunc + srcOff, len);
-                srcOff += len;
-                dstOff += len;
+            if (onPacket) {
+                onPacket(false, (const uint8_t*)buf, result);
             }
         }
 
-        // Write JMP back to original function after stolen bytes
-        DWORD jmpBackAddr = (DWORD)targetFunc + stolenBytes;
-        trampoline[dstOff] = 0xE9;
-        *(int32_t*)(trampoline + dstOff + 1) =
-            (int32_t)(jmpBackAddr - (DWORD)(trampoline + dstOff + 5));
-
-        sprintf_s(dbgBuf, dbgBufSize, "OK: %d bytes stolen, trampoline %d bytes", stolenBytes, dstOff + 5);
-        return trampoline;
-    }
-
-    // Place JMP detour
-    inline bool PlaceDetour(uint8_t* targetFunc, DWORD hookFunc, uint8_t* origBackup, int stolenBytes) {
-        DWORD oldProt;
-        if (!VirtualProtect(targetFunc, stolenBytes, PAGE_EXECUTE_READWRITE, &oldProt))
-            return false;
-
-        memcpy(origBackup, targetFunc, stolenBytes);
-
-        targetFunc[0] = 0xE9;
-        *(DWORD*)(targetFunc + 1) = hookFunc - (DWORD)(targetFunc + 5);
-
-        for (int i = 5; i < stolenBytes; i++)
-            targetFunc[i] = 0x90;
-
-        VirtualProtect(targetFunc, stolenBytes, oldProt, &oldProt);
-        return true;
-    }
-
-    // Restore original bytes
-    inline bool RemoveDetour(uint8_t* targetFunc, uint8_t* origBackup, int stolenBytes) {
-        DWORD oldProt;
-        if (!VirtualProtect(targetFunc, stolenBytes, PAGE_EXECUTE_READWRITE, &oldProt))
-            return false;
-        memcpy(targetFunc, origBackup, stolenBytes);
-        VirtualProtect(targetFunc, stolenBytes, oldProt, &oldProt);
-        return true;
+        return result;
     }
 
     // ---- Hex dump helper ----
-    inline void DumpBytes(DWORD addr, int count, char* out, int outSize) {
+    inline void HexDump(DWORD addr, int count, char* out, int outSize) {
         int pos = 0;
         for (int i = 0; i < count && pos < outSize - 4; i++) {
             pos += sprintf_s(out + pos, outSize - pos, "%02X ", *(uint8_t*)(addr + i));
         }
     }
 
+    // ---- Resolve JMP stub to find real function ----
+    inline DWORD ResolveFunction(DWORD addr, const char* name) {
+        uint8_t* p = (uint8_t*)addr;
+
+        for (int i = 0; i < 5; i++) {
+            if (p[0] == 0xFF && p[1] == 0x25) {
+                // JMP dword ptr [imm32] - indirect absolute jump
+                DWORD ptrAddr = *(DWORD*)(p + 2);
+                DWORD target = *(DWORD*)ptrAddr;
+                DbgLog("  %s: FF 25 stub -> ptr at 0x%08X -> target 0x%08X\n", name, ptrAddr, target);
+                p = (uint8_t*)target;
+                continue;
+            }
+            if (p[0] == 0xE9) {
+                // JMP rel32
+                int32_t offset = *(int32_t*)(p + 1);
+                DWORD target = (DWORD)p + 5 + offset;
+                DbgLog("  %s: E9 rel32 -> target 0x%08X\n", name, target);
+                p = (uint8_t*)target;
+                continue;
+            }
+            if (p[0] == 0xEB) {
+                // JMP rel8
+                int8_t offset = *(int8_t*)(p + 1);
+                DWORD target = (DWORD)p + 2 + offset;
+                DbgLog("  %s: EB rel8 -> target 0x%08X\n", name, target);
+                p = (uint8_t*)target;
+                continue;
+            }
+            break;
+        }
+
+        return (DWORD)p;
+    }
+
+    // ---- Write a JMP at target address ----
+    inline bool WriteJmp(DWORD targetAddr, DWORD hookAddr, uint8_t* backup, int patchSize) {
+        DWORD oldProt;
+        if (!VirtualProtect((void*)targetAddr, patchSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            DbgLog("  VirtualProtect failed: error %d\n", GetLastError());
+            return false;
+        }
+
+        // Backup original bytes
+        memcpy(backup, (void*)targetAddr, patchSize);
+
+        // Write JMP rel32
+        *(uint8_t*)targetAddr = 0xE9;
+        *(int32_t*)(targetAddr + 1) = (int32_t)(hookAddr - (targetAddr + 5));
+
+        // NOP remaining bytes
+        for (int i = 5; i < patchSize; i++)
+            *(uint8_t*)(targetAddr + i) = 0x90;
+
+        VirtualProtect((void*)targetAddr, patchSize, oldProt, &oldProt);
+        return true;
+    }
+
+    // ---- Restore original bytes ----
+    inline bool RestoreBytes(DWORD targetAddr, uint8_t* backup, int patchSize) {
+        DWORD oldProt;
+        if (!VirtualProtect((void*)targetAddr, patchSize, PAGE_EXECUTE_READWRITE, &oldProt))
+            return false;
+        memcpy((void*)targetAddr, backup, patchSize);
+        VirtualProtect((void*)targetAddr, patchSize, oldProt, &oldProt);
+        return true;
+    }
+
     // ---- Install Hooks ----
     inline bool InstallNetworkHooks() {
-        int dbgPos = 0;
+        debugPos = 0;
+        memset(debugInfo, 0, sizeof(debugInfo));
 
-        // Get wsock32 send/recv addresses
+        DbgLog("=== Hook Install v3 ===\n");
+
+        // Step 1: Get wsock32 module
         HMODULE hWsock = GetModuleHandleA("wsock32.dll");
         if (!hWsock) hWsock = LoadLibraryA("wsock32.dll");
         if (!hWsock) {
-            sprintf_s(debugInfo, "wsock32.dll not found");
+            DbgLog("FAIL: wsock32.dll not found\n");
+            return false;
+        }
+        DbgLog("wsock32.dll at: 0x%08X\n", (DWORD)hWsock);
+
+        // Also get ws2_32 module
+        HMODULE hWs2 = GetModuleHandleA("ws2_32.dll");
+        if (!hWs2) hWs2 = LoadLibraryA("ws2_32.dll");
+        DbgLog("ws2_32.dll at: 0x%08X\n", (DWORD)hWs2);
+
+        // Step 2: Get wsock32 export addresses
+        wsockSendAddr = (DWORD)GetProcAddress(hWsock, "send");
+        wsockRecvAddr = (DWORD)GetProcAddress(hWsock, "recv");
+
+        if (!wsockSendAddr || !wsockRecvAddr) {
+            DbgLog("FAIL: GetProcAddress failed\n");
             return false;
         }
 
-        DWORD rawSend = (DWORD)GetProcAddress(hWsock, "send");
-        DWORD rawRecv = (DWORD)GetProcAddress(hWsock, "recv");
+        // Dump raw bytes
+        char hexBuf[128];
+        HexDump(wsockSendAddr, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("wsock32.send (0x%08X): %s\n", wsockSendAddr, hexBuf);
+        HexDump(wsockRecvAddr, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("wsock32.recv (0x%08X): %s\n", wsockRecvAddr, hexBuf);
 
-        if (!rawSend || !rawRecv) {
-            sprintf_s(debugInfo, "GetProcAddress failed");
-            return false;
+        // Step 3: Resolve to real ws2_32 functions
+        DbgLog("Resolving JMP stubs...\n");
+        DWORD realSend = ResolveFunction(wsockSendAddr, "send");
+        DWORD realRecv = ResolveFunction(wsockRecvAddr, "recv");
+
+        HexDump(realSend, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("Real send (0x%08X): %s\n", realSend, hexBuf);
+        HexDump(realRecv, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("Real recv (0x%08X): %s\n", realRecv, hexBuf);
+
+        // Also try getting ws2_32 exports directly for comparison
+        if (hWs2) {
+            DWORD ws2Send = (DWORD)GetProcAddress(hWs2, "send");
+            DWORD ws2Recv = (DWORD)GetProcAddress(hWs2, "recv");
+            DbgLog("ws2_32.send direct: 0x%08X (match: %s)\n", ws2Send,
+                ws2Send == realSend ? "YES" : "NO");
+            DbgLog("ws2_32.recv direct: 0x%08X (match: %s)\n", ws2Recv,
+                ws2Recv == realRecv ? "YES" : "NO");
         }
 
-        // Dump raw function bytes
-        char sendDump[128], recvDump[128];
-        DumpBytes(rawSend, 16, sendDump, sizeof(sendDump));
-        DumpBytes(rawRecv, 16, recvDump, sizeof(recvDump));
+        // Step 4: Save real function pointers
+        pRealSend = (tSend)realSend;
+        pRealRecv = (tRecv)realRecv;
 
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "wsock32.send raw: 0x%08X [%s]\n", rawSend, sendDump);
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "wsock32.recv raw: 0x%08X [%s]\n", rawRecv, recvDump);
+        // Step 5: Determine patch size for the wsock32 stubs
+        // FF 25 stubs are 6 bytes, E9 stubs are 5 bytes
+        uint8_t* pSend = (uint8_t*)wsockSendAddr;
+        uint8_t* pRecv = (uint8_t*)wsockRecvAddr;
 
-        // Resolve JMP stubs to find real functions (typically in ws2_32.dll)
-        sendFuncAddr = ResolveFunction(rawSend);
-        recvFuncAddr = ResolveFunction(rawRecv);
-
-        DumpBytes(sendFuncAddr, 16, sendDump, sizeof(sendDump));
-        DumpBytes(recvFuncAddr, 16, recvDump, sizeof(recvDump));
-
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "Resolved send: 0x%08X [%s]\n", sendFuncAddr, sendDump);
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "Resolved recv: 0x%08X [%s]\n", recvFuncAddr, recvDump);
-
-        // Check if the resolved address has a hot-patch prologue (MOV EDI, EDI = 8B FF)
-        // If so, we can use the 5 NOP bytes before the function for a cleaner hook
-        uint8_t* pSend = (uint8_t*)sendFuncAddr;
-        uint8_t* pRecv = (uint8_t*)recvFuncAddr;
-
-        bool sendHotPatch = (pSend[0] == 0x8B && pSend[1] == 0xFF);
-        bool recvHotPatch = (pRecv[0] == 0x8B && pRecv[1] == 0xFF);
-
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "Hot-patch: send=%s recv=%s\n",
-            sendHotPatch ? "YES" : "NO",
-            recvHotPatch ? "YES" : "NO");
-
-        // Create trampolines
-        char sendTrResult[256], recvTrResult[256];
-        sendTrampoline = CreateTrampoline(pSend, sendStolenBytes, sendTrResult, sizeof(sendTrResult));
-        recvTrampoline = CreateTrampoline(pRecv, recvStolenBytes, recvTrResult, sizeof(recvTrResult));
-
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "Send trampoline: %s\n", sendTrResult);
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "Recv trampoline: %s\n", recvTrResult);
-
-        if (!sendTrampoline || !recvTrampoline) {
-            return false;
+        if (pSend[0] == 0xFF && pSend[1] == 0x25) {
+            sendPatchSize = 6;  // FF 25 xx xx xx xx
+            DbgLog("send stub: FF 25 indirect JMP (6 bytes)\n");
+        }
+        else if (pSend[0] == 0xE9) {
+            sendPatchSize = 5;  // E9 xx xx xx xx
+            DbgLog("send stub: E9 relative JMP (5 bytes)\n");
+        }
+        else {
+            // Not a stub - it's the real function. Hook it directly.
+            // Need at least 5 bytes. Assume standard prologue.
+            sendPatchSize = 5;
+            DbgLog("send: NOT a stub, hooking directly (5 bytes)\n");
+            // In this case, we can't just call pRealSend - we need a trampoline
+            // For now, try to use ws2_32.send directly
+            if (hWs2) {
+                DWORD ws2Send = (DWORD)GetProcAddress(hWs2, "send");
+                if (ws2Send && ws2Send != wsockSendAddr) {
+                    pRealSend = (tSend)ws2Send;
+                    DbgLog("  Using ws2_32.send (0x%08X) as original\n", ws2Send);
+                }
+                else {
+                    DbgLog("  WARNING: Cannot find alternate send - may crash!\n");
+                }
+            }
         }
 
-        // Set original function pointers to trampolines
-        oSend = (tSend)sendTrampoline;
-        oRecv = (tRecv)recvTrampoline;
+        if (pRecv[0] == 0xFF && pRecv[1] == 0x25) {
+            recvPatchSize = 6;
+            DbgLog("recv stub: FF 25 indirect JMP (6 bytes)\n");
+        }
+        else if (pRecv[0] == 0xE9) {
+            recvPatchSize = 5;
+            DbgLog("recv stub: E9 relative JMP (5 bytes)\n");
+        }
+        else {
+            recvPatchSize = 5;
+            DbgLog("recv: NOT a stub, hooking directly (5 bytes)\n");
+            if (hWs2) {
+                DWORD ws2Recv = (DWORD)GetProcAddress(hWs2, "recv");
+                if (ws2Recv && ws2Recv != wsockRecvAddr) {
+                    pRealRecv = (tRecv)ws2Recv;
+                    DbgLog("  Using ws2_32.recv (0x%08X) as original\n", ws2Recv);
+                }
+            }
+        }
 
-        // Place detours
-        bool sendOk = PlaceDetour(pSend, (DWORD)&hkSendImpl, sendOrigBytes, sendStolenBytes);
-        bool recvOk = PlaceDetour(pRecv, (DWORD)&hkRecvImpl, recvOrigBytes, recvStolenBytes);
+        // Step 6: Get our hook function addresses
+        DWORD hookSendAddr = (DWORD)&hkSendImpl;
+        DWORD hookRecvAddr = (DWORD)&hkRecvImpl;
+        DbgLog("hkSendImpl at: 0x%08X\n", hookSendAddr);
+        DbgLog("hkRecvImpl at: 0x%08X\n", hookRecvAddr);
 
-        dbgPos += sprintf_s(debugInfo + dbgPos, sizeof(debugInfo) - dbgPos,
-            "Detour placed: send=%s recv=%s\n",
-            sendOk ? "OK" : "FAIL",
-            recvOk ? "OK" : "FAIL");
+        // Step 7: Write the JMP hooks
+        DbgLog("Writing hooks...\n");
+
+        bool sendOk = WriteJmp(wsockSendAddr, hookSendAddr, sendOrigBytes, sendPatchSize);
+        DbgLog("send hook: %s\n", sendOk ? "OK" : "FAIL");
+
+        bool recvOk = WriteJmp(wsockRecvAddr, hookRecvAddr, recvOrigBytes, recvPatchSize);
+        DbgLog("recv hook: %s\n", recvOk ? "OK" : "FAIL");
+
+        // Verify the patch
+        if (sendOk) {
+            HexDump(wsockSendAddr, 8, hexBuf, sizeof(hexBuf));
+            DbgLog("send after patch: %s\n", hexBuf);
+        }
+        if (recvOk) {
+            HexDump(wsockRecvAddr, 8, hexBuf, sizeof(hexBuf));
+            DbgLog("recv after patch: %s\n", hexBuf);
+        }
+
+        DbgLog("=== Hook Install Complete ===\n");
 
         return sendOk && recvOk;
     }
 
     // ---- Remove Hooks ----
     inline void RemoveNetworkHooks() {
-        if (sendFuncAddr && sendStolenBytes > 0)
-            RemoveDetour((uint8_t*)sendFuncAddr, sendOrigBytes, sendStolenBytes);
-        if (recvFuncAddr && recvStolenBytes > 0)
-            RemoveDetour((uint8_t*)recvFuncAddr, recvOrigBytes, recvStolenBytes);
-        if (sendTrampoline) { VirtualFree(sendTrampoline, 0, MEM_RELEASE); sendTrampoline = nullptr; }
-        if (recvTrampoline) { VirtualFree(recvTrampoline, 0, MEM_RELEASE); recvTrampoline = nullptr; }
-        oSend = nullptr;
-        oRecv = nullptr;
+        if (wsockSendAddr && sendPatchSize > 0)
+            RestoreBytes(wsockSendAddr, sendOrigBytes, sendPatchSize);
+        if (wsockRecvAddr && recvPatchSize > 0)
+            RestoreBytes(wsockRecvAddr, recvOrigBytes, recvPatchSize);
+        pRealSend = nullptr;
+        pRealRecv = nullptr;
+        if (logFile) { fclose(logFile); logFile = nullptr; }
     }
 
     // ---- IAT Hook Helper (for DefenderBypass) ----
@@ -515,56 +412,6 @@ namespace Hooks {
             }
         }
         return false;
-    }
-
-    // ---- Hook implementations (NOT inline - need stable addresses) ----
-    // Using __declspec(noinline) to guarantee the compiler gives us a real function address
-
-    __declspec(noinline) int WINAPI hkSendImpl(SOCKET s, const char* buf, int len, int flags) {
-        if (gameSocket == INVALID_SOCKET)
-            gameSocket = s;
-
-        {
-            std::lock_guard<std::mutex> lock(logMutex);
-            PacketLog entry;
-            entry.isSend = true;
-            entry.timestamp = GetTickCount();
-            if (len > 0 && buf)
-                entry.data.assign((uint8_t*)buf, (uint8_t*)buf + len);
-            packetLog.push_back(entry);
-            if (packetLog.size() > MAX_LOG_SIZE)
-                packetLog.erase(packetLog.begin());
-        }
-
-        if (onPacket) {
-            bool allow = onPacket(true, (const uint8_t*)buf, len);
-            if (!allow) return len;
-        }
-
-        return oSend(s, buf, len, flags);
-    }
-
-    __declspec(noinline) int WINAPI hkRecvImpl(SOCKET s, char* buf, int len, int flags) {
-        int result = oRecv(s, buf, len, flags);
-
-        if (result > 0) {
-            {
-                std::lock_guard<std::mutex> lock(logMutex);
-                PacketLog entry;
-                entry.isSend = false;
-                entry.timestamp = GetTickCount();
-                entry.data.assign((uint8_t*)buf, (uint8_t*)buf + result);
-                packetLog.push_back(entry);
-                if (packetLog.size() > MAX_LOG_SIZE)
-                    packetLog.erase(packetLog.begin());
-            }
-
-            if (onPacket) {
-                onPacket(false, (const uint8_t*)buf, result);
-            }
-        }
-
-        return result;
     }
 
 } // namespace Hooks

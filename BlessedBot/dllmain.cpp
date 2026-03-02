@@ -46,8 +46,8 @@ void OnHookClick() {
         return;
     }
 
-    BotUI::Log("[*] Installing network hooks (inline detour v2)...");
-    BotUI::Log("[*] Resolving JMP stubs and hooking real functions...");
+    BotUI::Log("[*] Installing network hooks v3 (stub replacement)...");
+    BotUI::Log("[*] No trampoline - direct ws2_32 call approach...");
 
     if (Hooks::InstallNetworkHooks()) {
         g_hooksInstalled = true;
@@ -75,7 +75,8 @@ void OnHookClick() {
 
         BotUI::Log("[+] Network hooks installed successfully!");
         BotUI::Log("[+] IAT entries untouched - KODefender safe");
-        BotUI::SetStatus("Status: Hooks active (detour v2)");
+        BotUI::Log("[+] Debug log also written to BlessedBot_debug.log");
+        BotUI::SetStatus("Status: Hooks active (v3)");
     }
     else {
         BotUI::Log("[-] Failed to install inline hooks!");
