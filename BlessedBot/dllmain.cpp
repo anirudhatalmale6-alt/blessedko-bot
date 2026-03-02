@@ -46,17 +46,34 @@ void OnHookClick() {
         return;
     }
 
-    BotUI::Log("[*] Installing network hooks...");
+    BotUI::Log("[*] Installing network hooks (inline detour)...");
+
+    char buf[256];
+
+    HMODULE hWsock = GetModuleHandleA("wsock32.dll");
+    if (hWsock) {
+        DWORD sendAddr = (DWORD)GetProcAddress(hWsock, "send");
+        DWORD recvAddr = (DWORD)GetProcAddress(hWsock, "recv");
+        sprintf_s(buf, "[*] wsock32.send at: 0x%08X", sendAddr);
+        BotUI::Log(buf);
+        sprintf_s(buf, "[*] wsock32.recv at: 0x%08X", recvAddr);
+        BotUI::Log(buf);
+    }
 
     if (Hooks::InstallNetworkHooks()) {
         g_hooksInstalled = true;
-        BotUI::Log("[+] send() hooked successfully");
-        BotUI::Log("[+] recv() hooked successfully");
-        BotUI::SetStatus("Status: Hooks active");
+        sprintf_s(buf, "[+] send() detoured (%d bytes stolen, trampoline at 0x%08X)",
+            Hooks::sendStolenBytes, (DWORD)Hooks::sendTrampoline);
+        BotUI::Log(buf);
+        sprintf_s(buf, "[+] recv() detoured (%d bytes stolen, trampoline at 0x%08X)",
+            Hooks::recvStolenBytes, (DWORD)Hooks::recvTrampoline);
+        BotUI::Log(buf);
+        BotUI::Log("[+] IAT entries untouched - KODefender checksum safe");
+        BotUI::SetStatus("Status: Hooks active (inline)");
     }
     else {
-        BotUI::Log("[-] Failed to install hooks!");
-        BotUI::Log("    Try: Make sure you're in-game (past login screen)");
+        BotUI::Log("[-] Failed to install inline hooks!");
+        BotUI::Log("    Try: Make sure wsock32.dll is loaded (past login screen)");
     }
 }
 
