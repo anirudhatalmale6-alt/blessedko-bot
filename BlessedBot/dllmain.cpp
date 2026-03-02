@@ -46,8 +46,8 @@ void OnHookClick() {
         return;
     }
 
-    BotUI::Log("[*] Installing network hooks v4 (hot-patch)...");
-    BotUI::Log("[*] Microsoft hot-patch technique - safe & undetectable...");
+    BotUI::Log("[*] Installing network hooks v5 (hot-patch + SEH)...");
+    BotUI::Log("[*] With crash protection and runtime diagnostics...");
 
     if (Hooks::InstallNetworkHooks()) {
         g_hooksInstalled = true;
@@ -75,8 +75,9 @@ void OnHookClick() {
 
         BotUI::Log("[+] Network hooks installed successfully!");
         BotUI::Log("[+] IAT entries untouched - KODefender safe");
-        BotUI::Log("[+] Debug log also written to BlessedBot_debug.log");
-        BotUI::SetStatus("Status: Hooks active (v4 hot-patch)");
+        BotUI::Log("[+] SEH crash protection active");
+        BotUI::Log("[+] Debug: BlessedBot_debug.log + BlessedBot_hook.log");
+        BotUI::SetStatus("Status: Hooks active (v5 hot-patch+SEH)");
     }
     else {
         BotUI::Log("[-] Failed to install inline hooks!");
@@ -141,6 +142,13 @@ void OnDumpClick() {
         BotUI::Log("[!] Install hooks first!");
         return;
     }
+
+    // Show hook stats first
+    char statsBuf[256];
+    Hooks::GetHookStats(statsBuf, sizeof(statsBuf));
+    char statsLine[300];
+    sprintf_s(statsLine, "[*] Hook stats: %s", statsBuf);
+    BotUI::Log(statsLine);
 
     std::lock_guard<std::mutex> lock(Hooks::logMutex);
 
