@@ -13,15 +13,13 @@
 
 // ============================================================
 // BlessedKO Bot - DLL Entry Point
-// Phase 1: Scanner, Hook, and Bypass validation tool
-// v6: Progressive diagnostic hook modes
+// v7: Call-site hooking (no system DLL modifications)
 // ============================================================
 
 static HMODULE g_hModule = nullptr;
 static bool g_running = false;
 static bool g_hooksInstalled = false;
 static bool g_defenderBypassed = false;
-static int g_hookMode = 0;  // 0=naked, 1=minimal, 2=full
 
 // ---- Helper: show debug info in UI ----
 static void ShowDebugInfo(const char* prefix) {
@@ -56,11 +54,9 @@ void OnScanClick() {
 
     if (result.success) {
         BotUI::SetStatus("Status: Scan complete");
-        BotUI::Log("[+] Scan finished. Check results above.");
     }
     else {
         BotUI::SetStatus("Status: Scan failed");
-        BotUI::Log("[-] Scan failed!");
     }
 }
 
@@ -70,33 +66,33 @@ void OnHookClick() {
         return;
     }
 
-    const char* modeNames[] = { "NAKED passthrough", "MINIMAL passthrough", "FULL (logging+SEH)" };
-    char msg[256];
-    sprintf_s(msg, "[*] Installing hooks v6 - Mode %d: %s", g_hookMode, modeNames[g_hookMode]);
-    BotUI::Log(msg);
+    BotUI::Log("[*] Installing hooks v7 (call-site patching)...");
+    BotUI::Log("[*] Strategy: Patch CALL instructions in game code");
+    BotUI::Log("[*] System DLL bytes: UNTOUCHED");
+    BotUI::Log("[*] IAT entries: UNTOUCHED");
+    BotUI::Log("");
 
-    if (g_hookMode == 0) {
-        BotUI::Log("[*] NAKED mode: zero code execution, pure JMP forwarding");
-        BotUI::Log("[*] If this crashes, the trampoline mechanism is broken");
-        BotUI::Log("[*] If this WORKS, the game will run normally (invisible hook)");
-    }
-
-    if (Hooks::InstallNetworkHooks(g_hookMode)) {
+    if (Hooks::InstallNetworkHooks()) {
         g_hooksInstalled = true;
         ShowDebugInfo("[*]");
 
-        sprintf_s(msg, "[+] Hooks active! Mode %d: %s", g_hookMode, modeNames[g_hookMode]);
+        char msg[256];
+        sprintf_s(msg, "[+] Hooks active! %zu send + %zu recv call sites patched",
+            Hooks::sendCallSites.size(), Hooks::recvCallSites.size());
         BotUI::Log(msg);
-        BotUI::Log("[+] If game is still running - HOOKS WORK!");
-        BotUI::Log("[+] Check BlessedBot_debug.log + BlessedBot_hook.log");
-
-        sprintf_s(msg, "Status: Hooks active (v6 mode %d)", g_hookMode);
-        BotUI::SetStatus(msg);
+        BotUI::Log("[+] wsock32/ws2_32 bytes: UNMODIFIED (KODefender safe!)");
+        BotUI::Log("[+] Packet capture is LIVE");
+        BotUI::SetStatus("Status: Hooks active (v7 call-site)");
     }
     else {
-        BotUI::Log("[-] Failed to install hooks!");
+        BotUI::Log("[-] No call sites found - see debug log for scan results");
         ShowDebugInfo("[-]");
-        BotUI::Log("    Send screenshots of logs to me for debugging!");
+        BotUI::Log("");
+        BotUI::Log("[!] If 0 call sites found, the game might use:");
+        BotUI::Log("    - Indirect calls (MOV reg, [IAT]; CALL reg)");
+        BotUI::Log("    - Encrypted code sections (runtime unpacker)");
+        BotUI::Log("    Check BlessedBot_debug.log for alternative patterns found");
+        BotUI::SetStatus("Status: Hook failed - check logs");
     }
 }
 
@@ -111,7 +107,6 @@ void OnBypassClick() {
     HMODULE hDefender = GetModuleHandleA("KODefender.dll");
     if (!hDefender) {
         BotUI::Log("[!] KODefender.dll not loaded - nothing to bypass");
-        BotUI::Log("    This is actually good news - no anti-cheat active!");
         g_defenderBypassed = true;
         BotUI::SetStatus("Status: No defender (safe)");
         return;
@@ -121,11 +116,7 @@ void OnBypassClick() {
 
     if (Defender::Install(g_hModule)) {
         g_defenderBypassed = true;
-        BotUI::Log("[+] IsDebuggerPresent hooked");
-        BotUI::Log("[+] K32EnumProcesses hooked");
-        BotUI::Log("[+] K32GetModuleBaseNameA hooked");
-        BotUI::Log("[+] ReadProcessMemory hooked");
-        BotUI::Log("[+] Detection strings patched");
+        BotUI::Log("[+] Defender bypassed successfully");
         BotUI::SetStatus("Status: Defender bypassed");
     }
     else {
@@ -139,19 +130,11 @@ void OnDumpClick() {
         return;
     }
 
-    // Show hook stats
     char statsBuf[256];
     Hooks::GetHookStats(statsBuf, sizeof(statsBuf));
     char statsLine[300];
     sprintf_s(statsLine, "[*] Hook stats: %s", statsBuf);
     BotUI::Log(statsLine);
-
-    // Only show packet log in mode 2
-    if (g_hookMode < 2) {
-        BotUI::Log("[*] Packet capture only available in Mode 2 (FULL)");
-        BotUI::Log("[*] Current mode is passthrough - no packets captured");
-        return;
-    }
 
     std::lock_guard<std::mutex> lock(Hooks::logMutex);
 
@@ -217,31 +200,23 @@ void OnTestReadClick() {
     sprintf_s(buf, "[+] DOS magic: 0x%04X (should be 0x5A4D)", dos->e_magic);
     BotUI::Log(buf);
 
-    DWORD testStr = Scanner::FindString(hGame, "KnightOnline");
-    if (testStr) {
-        std::string s = MemScanner::ReadString(testStr, 32);
-        sprintf_s(buf, "[+] Found string at 0x%08X: \"%s\"", testStr, s.c_str());
-        BotUI::Log(buf);
-    }
+    // Check IAT entries
+    DWORD sendPtr = *(DWORD*)KO::IAT::WS_SEND;
+    DWORD recvPtr = *(DWORD*)KO::IAT::WS_RECV;
+    sprintf_s(buf, "[+] IAT send -> 0x%08X", sendPtr);
+    BotUI::Log(buf);
+    sprintf_s(buf, "[+] IAT recv -> 0x%08X", recvPtr);
+    BotUI::Log(buf);
 
-    DWORD loginStr = Scanner::FindString(hGame, "LoginUID");
-    if (loginStr) {
-        sprintf_s(buf, "[+] LoginUID reference at: 0x%08X", loginStr);
-        BotUI::Log(buf);
-    }
-
-    HMODULE hWsock = GetModuleHandleA("wsock32.dll");
-    if (hWsock) {
-        sprintf_s(buf, "[+] wsock32.dll at: 0x%08X", (DWORD)hWsock);
-        BotUI::Log(buf);
-
-        DWORD sendAddr = MemScanner::ReadMem<DWORD>(KO::IAT::WS_SEND);
-        DWORD recvAddr = MemScanner::ReadMem<DWORD>(KO::IAT::WS_RECV);
-        sprintf_s(buf, "[+] IAT send() -> 0x%08X", sendAddr);
-        BotUI::Log(buf);
-        sprintf_s(buf, "[+] IAT recv() -> 0x%08X", recvAddr);
-        BotUI::Log(buf);
-    }
+    // Verify send/recv function bytes are UNMODIFIED
+    uint8_t* sendBytes = (uint8_t*)sendPtr;
+    uint8_t* recvBytes = (uint8_t*)recvPtr;
+    sprintf_s(buf, "[+] send bytes: %02X %02X %02X (should be 8B FF 55)",
+        sendBytes[0], sendBytes[1], sendBytes[2]);
+    BotUI::Log(buf);
+    sprintf_s(buf, "[+] recv bytes: %02X %02X %02X (should be 8B FF 55)",
+        recvBytes[0], recvBytes[1], recvBytes[2]);
+    BotUI::Log(buf);
 
     BotUI::Log("[+] Memory read test complete");
 }
@@ -258,18 +233,17 @@ void BotThread() {
     BotUI::onDumpClick = OnDumpClick;
     BotUI::onTestReadClick = OnTestReadClick;
 
-    BotUI::Log("=== BlessedKO Bot v6 - Diagnostic Build ===");
-    BotUI::Log("Progressive Hook Testing");
-    BotUI::Log("=========================================");
+    BotUI::Log("=== BlessedKO Bot v7 - Call-Site Hooks ===");
+    BotUI::Log("No system DLL modifications!");
+    BotUI::Log("==========================================");
     BotUI::Log("");
-    BotUI::Log("Hook Mode 0: NAKED (pure JMP, zero code)");
-    BotUI::Log("  Tests if hot-patch + trampoline work at all");
+    BotUI::Log("v6 proved: KODefender checks send/recv bytes");
+    BotUI::Log("v7 fix: Hook the game's CALL instructions instead");
     BotUI::Log("");
     BotUI::Log("Instructions:");
     BotUI::Log("1. Click 'Bypass Defender' first");
-    BotUI::Log("2. Click 'Hook Net' (starts in Mode 0)");
-    BotUI::Log("3. If game survives 10+ seconds = SUCCESS");
-    BotUI::Log("4. Send me both .log files");
+    BotUI::Log("2. Click 'Hook Net' to install call-site hooks");
+    BotUI::Log("3. Play normally, then 'Dump Packets'");
     BotUI::Log("");
     BotUI::Log("[+] Bot DLL loaded successfully!");
 

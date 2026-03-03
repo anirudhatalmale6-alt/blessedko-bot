@@ -8,19 +8,25 @@
 #include "../Common/KOStructs.h"
 
 // ============================================================
-// Hooks v6 - Progressive Diagnostic Build
+// Hooks v7 - Call-Site Hooking
 //
-// v5 showed: hot-patch install is 100% correct, but runtime crash
-// persists (even SEH didn't catch it). This suggests the crash
-// is either in the calling mechanism itself, or a stack overflow.
+// v6 Mode 0 (NAKED passthrough, literally one JMP instruction)
+// STILL crashed. This proves KODefender has a function-byte
+// integrity check on wsock32/ws2_32 send/recv.
 //
-// v6 Strategy: THREE HOOK MODES tested progressively
-//   Mode 0: NAKED passthrough (just JMP to trampoline, zero code)
-//   Mode 1: Minimal __stdcall passthrough (one CALL, no extras)
-//   Mode 2: Full implementation (logging + packet capture + SEH)
+// v7 Solution: DON'T modify system DLL bytes at all!
+// Instead, find the game's CALL DWORD PTR [IAT_send] instructions
+// in KnightOnLine.exe and redirect THOSE to our hooks.
 //
-// Start in Mode 0. If game survives, upgrade to Mode 1, then 2.
-// This binary search finds exactly what causes the crash.
+// The game code does: CALL DWORD PTR [0x00C53610]  (FF 15 10 36 C5 00)
+// We replace with:    CALL our_hkSend; NOP         (E8 xx xx xx xx 90)
+//
+// KODefender checks:
+//   - IAT entries (v1 "Cheat Detected")
+//   - Function bytes of send/recv (v2-v6 silent crash)
+//   - But NOT every CALL instruction in the game code!
+//
+// Our hook calls real send/recv directly (they're UNMODIFIED).
 // ============================================================
 
 namespace Hooks {
@@ -28,41 +34,28 @@ namespace Hooks {
     typedef int (WINAPI* tSend)(SOCKET s, const char* buf, int len, int flags);
     typedef int (WINAPI* tRecv)(SOCKET s, char* buf, int len, int flags);
 
-    // Hook mode: 0=naked, 1=passthrough, 2=full
-    inline volatile LONG hookMode = 0;
-
-    // Trampoline pointers - used by naked asm hooks
-    // These MUST be simple globals (not volatile) for __asm access
-    inline tSend g_origSend = nullptr;
-    inline tRecv g_origRecv = nullptr;
-
-    // Also keep volatile versions for C++ code paths
-    inline volatile tSend oSend = nullptr;
-    inline volatile tRecv oRecv = nullptr;
+    // Real function pointers (read from IAT before any modification)
+    inline tSend realSend = nullptr;
+    inline tRecv realRecv = nullptr;
 
     inline volatile SOCKET gameSocket = INVALID_SOCKET;
 
-    // Hooked function addresses
-    inline DWORD sendFuncAddr = 0;
-    inline DWORD recvFuncAddr = 0;
+    // Call site tracking
+    struct CallSite {
+        DWORD address;        // Address of the CALL instruction
+        uint8_t origBytes[6]; // Original 6 bytes (FF 15 xx xx xx xx)
+    };
+    inline std::vector<CallSite> sendCallSites;
+    inline std::vector<CallSite> recvCallSites;
 
-    // Original bytes for unhooking
-    inline uint8_t sendOrigPad[5] = {};
-    inline uint8_t sendOrigHead[2] = {};
-    inline uint8_t recvOrigPad[5] = {};
-    inline uint8_t recvOrigHead[2] = {};
-
-    // Trampolines
-    inline uint8_t* sendTrampoline = nullptr;
-    inline uint8_t* recvTrampoline = nullptr;
-
-    // Hook call counters
+    // Hook counters
     inline volatile LONG sendHookCount = 0;
     inline volatile LONG recvHookCount = 0;
-    inline volatile LONG sendCrashCount = 0;
-    inline volatile LONG recvCrashCount = 0;
 
-    // ==== Win32-only crash-safe logging (no CRT) ====
+    // Debug
+    inline FILE* logFile = nullptr;
+    inline char debugInfo[4096] = {};
+    inline int debugPos = 0;
     inline HANDLE hHookLog = INVALID_HANDLE_VALUE;
 
     inline void RawLog(const char* msg) {
@@ -95,11 +88,6 @@ namespace Hooks {
         RawLog(buf);
     }
 
-    // ==== Install-time debug logging ====
-    inline FILE* logFile = nullptr;
-    inline char debugInfo[4096] = {};
-    inline int debugPos = 0;
-
     inline void LogToFile(const char* fmt, ...) {
         if (!logFile) fopen_s(&logFile, "BlessedBot_debug.log", "a");
         if (logFile) {
@@ -123,7 +111,7 @@ namespace Hooks {
         va_end(args);
     }
 
-    // Packet log (used in Mode 2 only)
+    // Packet log
     struct PacketLog {
         bool     isSend;
         DWORD    timestamp;
@@ -138,55 +126,32 @@ namespace Hooks {
     inline PacketCallback onPacket = nullptr;
 
     inline int SendGamePacket(const uint8_t* data, int len) {
-        tSend fn = g_origSend;
-        volatile SOCKET sock = gameSocket;
-        if (fn && sock != INVALID_SOCKET)
-            return fn(sock, (const char*)data, len, 0);
+        if (realSend && gameSocket != INVALID_SOCKET)
+            return realSend(gameSocket, (const char*)data, len, 0);
         return -1;
     }
 
     // ================================================================
-    // MODE 0: NAKED PASSTHROUGH (absolute minimum - just JMP forward)
-    // No prologue, no epilogue, no stack manipulation at all.
-    // If this crashes, the trampoline itself is broken.
+    // HOOK FUNCTIONS
+    // These are proper __stdcall functions called from patched CALL sites.
+    // They call the REAL send/recv (unmodified system functions).
     // ================================================================
-#pragma warning(push)
-#pragma warning(disable: 4740) // inline asm suppresses global optimization
-    __declspec(naked) static void hkSendNaked() {
-        __asm {
-            jmp dword ptr [g_origSend]
-        }
-    }
 
-    __declspec(naked) static void hkRecvNaked() {
-        __asm {
-            jmp dword ptr [g_origRecv]
-        }
-    }
-#pragma warning(pop)
+    __declspec(noinline) static int __stdcall hkSend(SOCKET s, const char* buf, int len, int flags) {
+        LONG count = InterlockedIncrement(&sendHookCount);
 
-    // ================================================================
-    // MODE 1: MINIMAL PASSTHROUGH (proper __stdcall, one CALL only)
-    // Tests that the calling convention is correct.
-    // If Mode 0 works but this crashes, it's a calling convention issue.
-    // ================================================================
-    __declspec(noinline) static int __stdcall hkSendMinimal(SOCKET s, const char* buf, int len, int flags) {
-        InterlockedIncrement(&sendHookCount);
-        return g_origSend(s, buf, len, flags);
-    }
-
-    __declspec(noinline) static int __stdcall hkRecvMinimal(SOCKET s, char* buf, int len, int flags) {
-        InterlockedIncrement(&recvHookCount);
-        return g_origRecv(s, buf, len, flags);
-    }
-
-    // ================================================================
-    // MODE 2: FULL IMPLEMENTATION (logging + packet capture + SEH)
-    // ================================================================
-    __declspec(noinline) static int __stdcall hkSendInner(SOCKET s, const char* buf, int len, int flags) {
         if (gameSocket == INVALID_SOCKET)
             gameSocket = s;
 
+        // Log first call
+        if (count == 1) {
+            RawLog("=== hkSend ENTERED (first call) ===\n");
+            RawLogHex("  socket: ", (DWORD)s);
+            RawLogHex("  len: ", (DWORD)len);
+            RawLogHex("  realSend: ", (DWORD)realSend);
+        }
+
+        // Log packet
         {
             std::lock_guard<std::mutex> lock(logMutex);
             PacketLog entry;
@@ -204,11 +169,22 @@ namespace Hooks {
             if (!allow) return len;
         }
 
-        return g_origSend(s, buf, len, flags);
+        // Call REAL send (unmodified function!)
+        return realSend(s, buf, len, flags);
     }
 
-    __declspec(noinline) static int __stdcall hkRecvInner(SOCKET s, char* buf, int len, int flags) {
-        int result = g_origRecv(s, buf, len, flags);
+    __declspec(noinline) static int __stdcall hkRecv(SOCKET s, char* buf, int len, int flags) {
+        LONG count = InterlockedIncrement(&recvHookCount);
+
+        if (count == 1) {
+            RawLog("=== hkRecv ENTERED (first call) ===\n");
+            RawLogHex("  socket: ", (DWORD)s);
+            RawLogHex("  len: ", (DWORD)len);
+            RawLogHex("  realRecv: ", (DWORD)realRecv);
+        }
+
+        // Call REAL recv (unmodified function!)
+        int result = realRecv(s, buf, len, flags);
 
         if (result > 0) {
             {
@@ -230,243 +206,256 @@ namespace Hooks {
         return result;
     }
 
-    __declspec(noinline) static int __stdcall hkSendFull(SOCKET s, const char* buf, int len, int flags) {
-        InterlockedIncrement(&sendHookCount);
-        __try {
-            return hkSendInner(s, buf, len, flags);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            InterlockedIncrement(&sendCrashCount);
-            return g_origSend(s, buf, len, flags);
-        }
-    }
+    // ================================================================
+    // CALL-SITE SCANNER & PATCHER
+    // Finds CALL DWORD PTR [IAT_addr] instructions in game code
+    // and replaces them with CALL our_hook + NOP
+    // ================================================================
 
-    __declspec(noinline) static int __stdcall hkRecvFull(SOCKET s, char* buf, int len, int flags) {
-        InterlockedIncrement(&recvHookCount);
-        __try {
-            return hkRecvInner(s, buf, len, flags);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            InterlockedIncrement(&recvCrashCount);
-            return g_origRecv(s, buf, len, flags);
-        }
-    }
+    // Scan a memory range for a 6-byte pattern: FF 15 [4-byte LE addr]
+    inline std::vector<DWORD> FindCallSites(DWORD startAddr, DWORD size, DWORD iatAddr) {
+        std::vector<DWORD> results;
+        uint8_t pattern[6];
+        pattern[0] = 0xFF;
+        pattern[1] = 0x15;
+        *(DWORD*)(pattern + 2) = iatAddr;
 
-    // ---- Hex dump helper ----
-    inline void HexDump(DWORD addr, int count, char* out, int outSize) {
-        int pos = 0;
-        for (int i = 0; i < count && pos < outSize - 4; i++)
-            pos += sprintf_s(out + pos, outSize - pos, "%02X ", *(uint8_t*)(addr + i));
-    }
-
-    // ---- Create hot-patch trampoline ----
-    inline uint8_t* CreateHotPatchTrampoline(DWORD funcAddr) {
-        uint8_t* tramp = (uint8_t*)VirtualAlloc(nullptr, 16,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!tramp) return nullptr;
-
-        tramp[0] = 0x8B;
-        tramp[1] = 0xFF;
-        tramp[2] = 0xE9;
-        DWORD jmpTarget = funcAddr + 2;
-        *(int32_t*)(tramp + 3) = (int32_t)(jmpTarget - (DWORD)(tramp + 7));
-
-        FlushInstructionCache(GetCurrentProcess(), tramp, 16);
-        return tramp;
-    }
-
-    // ---- Apply hot-patch hook ----
-    inline bool ApplyHotPatch(DWORD funcAddr, DWORD hookAddr,
-        uint8_t* backupPad, uint8_t* backupHead, const char* name) {
-
-        uint8_t* pFunc = (uint8_t*)funcAddr;
-
-        if (pFunc[0] != 0x8B || pFunc[1] != 0xFF) {
-            DbgLog("%s: NOT hot-patchable (bytes: %02X %02X, expected 8B FF)\n",
-                name, pFunc[0], pFunc[1]);
-            return false;
-        }
-
-        uint8_t* pPad = pFunc - 5;
-        bool padOk = true;
-        for (int i = 0; i < 5; i++) {
-            if (pPad[i] != 0xCC && pPad[i] != 0x90 && pPad[i] != 0x00) {
-                padOk = false;
-                break;
+        uint8_t* base = (uint8_t*)startAddr;
+        for (DWORD i = 0; i + 6 <= size; i++) {
+            if (memcmp(base + i, pattern, 6) == 0) {
+                results.push_back(startAddr + i);
             }
         }
+        return results;
+    }
 
-        char hexBuf[64];
-        HexDump((DWORD)pPad, 5, hexBuf, sizeof(hexBuf));
-        DbgLog("%s: padding [-5]: %s (%s)\n", name, hexBuf, padOk ? "OK" : "NOT standard");
+    // Patch a CALL site: replace FF 15 xx xx xx xx with E8 rel32 90
+    inline bool PatchCallSite(DWORD callAddr, DWORD hookFunc, uint8_t* backupBytes) {
+        uint8_t* p = (uint8_t*)callAddr;
 
-        memcpy(backupPad, pPad, 5);
-        memcpy(backupHead, pFunc, 2);
+        // Backup original 6 bytes
+        memcpy(backupBytes, p, 6);
+
+        // Calculate relative offset for E8 CALL
+        // E8 is 5 bytes, relative offset is from end of instruction (callAddr + 5)
+        int32_t rel = (int32_t)(hookFunc - (callAddr + 5));
 
         DWORD oldProt;
-        if (!VirtualProtect(pPad, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
-            DbgLog("%s: VirtualProtect failed: %d\n", name, GetLastError());
+        if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldProt))
             return false;
-        }
 
-        pPad[0] = 0xE9;
-        *(int32_t*)(pPad + 1) = (int32_t)(hookAddr - (DWORD)(pPad + 5));
+        p[0] = 0xE8;                  // CALL rel32
+        *(int32_t*)(p + 1) = rel;     // relative offset
+        p[5] = 0x90;                  // NOP (fill remaining byte)
 
-        pFunc[0] = 0xEB;
-        pFunc[1] = 0xF9;
-
-        VirtualProtect(pPad, 7, oldProt, &oldProt);
-        FlushInstructionCache(GetCurrentProcess(), pPad, 7);
-
-        HexDump((DWORD)pPad, 7, hexBuf, sizeof(hexBuf));
-        DbgLog("%s: patched [-5..+2]: %s\n", name, hexBuf);
-        DbgLog("%s: hook -> 0x%08X, trampoline -> 0x%08X\n", name, hookAddr, funcAddr + 2);
+        VirtualProtect(p, 6, oldProt, &oldProt);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
 
         return true;
     }
 
-    // ---- Restore hot-patch ----
-    inline bool RestoreHotPatch(DWORD funcAddr, uint8_t* backupPad, uint8_t* backupHead) {
-        uint8_t* pFunc = (uint8_t*)funcAddr;
-        uint8_t* pPad = pFunc - 5;
-
+    // Restore a patched CALL site
+    inline bool RestoreCallSite(DWORD callAddr, uint8_t* origBytes) {
+        uint8_t* p = (uint8_t*)callAddr;
         DWORD oldProt;
-        if (!VirtualProtect(pPad, 7, PAGE_EXECUTE_READWRITE, &oldProt))
+        if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldProt))
             return false;
-
-        memcpy(pPad, backupPad, 5);
-        memcpy(pFunc, backupHead, 2);
-
-        VirtualProtect(pPad, 7, oldProt, &oldProt);
-        FlushInstructionCache(GetCurrentProcess(), pPad, 7);
+        memcpy(p, origBytes, 6);
+        VirtualProtect(p, 6, oldProt, &oldProt);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
         return true;
     }
 
     // ---- Install Hooks ----
-    // mode: 0=naked, 1=minimal, 2=full
-    inline bool InstallNetworkHooks(int mode = 0) {
+    inline bool InstallNetworkHooks() {
         debugPos = 0;
         memset(debugInfo, 0, sizeof(debugInfo));
-        hookMode = mode;
 
-        const char* modeNames[] = { "NAKED passthrough", "MINIMAL passthrough", "FULL (logging+SEH)" };
-        DbgLog("=== Hook Install v6 - Mode %d: %s ===\n", mode, modeNames[mode]);
+        DbgLog("=== Hook Install v7 (Call-Site Hooking) ===\n");
+        DbgLog("Strategy: Patch game's CALL instructions, NOT system DLL bytes\n\n");
 
-        HMODULE hWsock = GetModuleHandleA("wsock32.dll");
-        if (!hWsock) hWsock = LoadLibraryA("wsock32.dll");
-        HMODULE hWs2 = GetModuleHandleA("ws2_32.dll");
-        if (!hWs2) hWs2 = LoadLibraryA("ws2_32.dll");
+        // Step 1: Get real function pointers from IAT
+        DWORD iatSendPtr = *(DWORD*)KO::IAT::WS_SEND;
+        DWORD iatRecvPtr = *(DWORD*)KO::IAT::WS_RECV;
 
-        if (!hWsock) { DbgLog("FAIL: wsock32.dll not found\n"); return false; }
+        realSend = (tSend)iatSendPtr;
+        realRecv = (tRecv)iatRecvPtr;
 
-        DbgLog("wsock32.dll at: 0x%08X\n", (DWORD)hWsock);
-        DbgLog("ws2_32.dll at: 0x%08X\n", (DWORD)hWs2);
+        DbgLog("IAT send entry at 0x%08X -> 0x%08X\n", KO::IAT::WS_SEND, iatSendPtr);
+        DbgLog("IAT recv entry at 0x%08X -> 0x%08X\n", KO::IAT::WS_RECV, iatRecvPtr);
+        DbgLog("realSend = 0x%08X\n", (DWORD)realSend);
+        DbgLog("realRecv = 0x%08X\n", (DWORD)realRecv);
 
-        DWORD wsockSend = (DWORD)GetProcAddress(hWsock, "send");
-        DWORD wsockRecv = (DWORD)GetProcAddress(hWsock, "recv");
-        DWORD ws2Send = hWs2 ? (DWORD)GetProcAddress(hWs2, "send") : 0;
+        // Verify real functions are intact (should start with 8B FF)
+        char hexBuf[64];
+        uint8_t* sendBytes = (uint8_t*)iatSendPtr;
+        uint8_t* recvBytes = (uint8_t*)iatRecvPtr;
+        sprintf_s(hexBuf, "%02X %02X %02X %02X %02X",
+            sendBytes[0], sendBytes[1], sendBytes[2], sendBytes[3], sendBytes[4]);
+        DbgLog("send function bytes: %s (should be 8B FF 55 8B EC)\n", hexBuf);
+        sprintf_s(hexBuf, "%02X %02X %02X %02X %02X",
+            recvBytes[0], recvBytes[1], recvBytes[2], recvBytes[3], recvBytes[4]);
+        DbgLog("recv function bytes: %s (should be 8B FF 55 8B EC)\n", hexBuf);
 
-        char hexBuf[128];
-        HexDump(wsockSend, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("wsock32.send (0x%08X): %s\n", wsockSend, hexBuf);
-        HexDump(wsockRecv, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("wsock32.recv (0x%08X): %s\n", wsockRecv, hexBuf);
-
-        DbgLog("wsock32.send == ws2_32.send? %s\n", wsockSend == ws2Send ? "YES (forwarded)" : "NO");
-
-        sendFuncAddr = wsockSend;
-        recvFuncAddr = wsockRecv;
-
-        // Create trampolines
-        sendTrampoline = CreateHotPatchTrampoline(sendFuncAddr);
-        recvTrampoline = CreateHotPatchTrampoline(recvFuncAddr);
-
-        if (!sendTrampoline || !recvTrampoline) {
-            DbgLog("FAIL: Could not allocate trampolines\n");
+        // Step 2: Get KnightOnLine.exe module info
+        HMODULE hGame = GetModuleHandleA(nullptr);
+        if (!hGame) {
+            DbgLog("FAIL: Cannot get game module\n");
             return false;
         }
 
-        // Set BOTH volatile and non-volatile originals
-        g_origSend = (tSend)sendTrampoline;
-        g_origRecv = (tRecv)recvTrampoline;
-        oSend = g_origSend;
-        oRecv = g_origRecv;
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hGame;
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((DWORD)hGame + dos->e_lfanew);
+        PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+        WORD numSections = nt->FileHeader.NumberOfSections;
 
-        DbgLog("send trampoline: 0x%08X\n", (DWORD)sendTrampoline);
-        DbgLog("recv trampoline: 0x%08X\n", (DWORD)recvTrampoline);
-        DbgLog("g_origSend: 0x%08X\n", (DWORD)g_origSend);
-        DbgLog("g_origRecv: 0x%08X\n", (DWORD)g_origRecv);
+        DbgLog("Game module: 0x%08X, %d sections\n", (DWORD)hGame, numSections);
 
-        HexDump((DWORD)sendTrampoline, 7, hexBuf, sizeof(hexBuf));
-        DbgLog("send trampoline bytes: %s\n", hexBuf);
-        HexDump((DWORD)recvTrampoline, 7, hexBuf, sizeof(hexBuf));
-        DbgLog("recv trampoline bytes: %s\n", hexBuf);
+        // Step 3: Scan ALL executable sections for CALL [IAT_send] and CALL [IAT_recv]
+        DWORD hookSendAddr = (DWORD)&hkSend;
+        DWORD hookRecvAddr = (DWORD)&hkRecv;
+        DbgLog("hkSend at: 0x%08X\n", hookSendAddr);
+        DbgLog("hkRecv at: 0x%08X\n", hookRecvAddr);
 
-        // Select hook functions based on mode
-        DWORD hookSendAddr, hookRecvAddr;
-        switch (mode) {
-        case 0:
-            hookSendAddr = (DWORD)&hkSendNaked;
-            hookRecvAddr = (DWORD)&hkRecvNaked;
-            DbgLog("Using NAKED hooks (zero overhead JMP)\n");
-            break;
-        case 1:
-            hookSendAddr = (DWORD)&hkSendMinimal;
-            hookRecvAddr = (DWORD)&hkRecvMinimal;
-            DbgLog("Using MINIMAL hooks (stdcall passthrough)\n");
-            break;
-        default:
-            hookSendAddr = (DWORD)&hkSendFull;
-            hookRecvAddr = (DWORD)&hkRecvFull;
-            DbgLog("Using FULL hooks (logging + SEH)\n");
-            break;
+        int totalSendSites = 0;
+        int totalRecvSites = 0;
+
+        DbgLog("\nScanning sections for CALL [IAT] patterns...\n");
+
+        for (WORD i = 0; i < numSections; i++) {
+            DWORD secStart = (DWORD)hGame + sections[i].VirtualAddress;
+            DWORD secSize = sections[i].Misc.VirtualSize;
+            DWORD secChars = sections[i].Characteristics;
+            char secName[9] = {};
+            memcpy(secName, sections[i].Name, 8);
+
+            // Only scan sections that contain code or are readable
+            bool isCode = (secChars & IMAGE_SCN_MEM_EXECUTE) != 0;
+            bool isReadable = (secChars & IMAGE_SCN_MEM_READ) != 0;
+
+            DbgLog("  Section '%s': 0x%08X size=0x%X [%s%s]\n",
+                secName, secStart, secSize,
+                isCode ? "CODE " : "",
+                isReadable ? "READ" : "");
+
+            if (!isReadable) continue;  // Can't scan unreadable sections
+
+            // Search for CALL DWORD PTR [WS_SEND] = FF 15 10 36 C5 00
+            auto sendSites = FindCallSites(secStart, secSize, KO::IAT::WS_SEND);
+            for (DWORD addr : sendSites) {
+                DbgLog("    SEND call site at 0x%08X\n", addr);
+                CallSite cs;
+                cs.address = addr;
+                if (PatchCallSite(addr, hookSendAddr, cs.origBytes)) {
+                    sendCallSites.push_back(cs);
+                    totalSendSites++;
+                    // Log patched bytes
+                    uint8_t* p = (uint8_t*)addr;
+                    DbgLog("      Patched: %02X %02X %02X %02X %02X %02X\n",
+                        p[0], p[1], p[2], p[3], p[4], p[5]);
+                }
+                else {
+                    DbgLog("      FAILED to patch!\n");
+                }
+            }
+
+            // Search for CALL DWORD PTR [WS_RECV] = FF 15 20 36 C5 00
+            auto recvSites = FindCallSites(secStart, secSize, KO::IAT::WS_RECV);
+            for (DWORD addr : recvSites) {
+                DbgLog("    RECV call site at 0x%08X\n", addr);
+                CallSite cs;
+                cs.address = addr;
+                if (PatchCallSite(addr, hookRecvAddr, cs.origBytes)) {
+                    recvCallSites.push_back(cs);
+                    totalRecvSites++;
+                    uint8_t* p = (uint8_t*)addr;
+                    DbgLog("      Patched: %02X %02X %02X %02X %02X %02X\n",
+                        p[0], p[1], p[2], p[3], p[4], p[5]);
+                }
+                else {
+                    DbgLog("      FAILED to patch!\n");
+                }
+            }
         }
 
-        DbgLog("hookSend at: 0x%08X\n", hookSendAddr);
-        DbgLog("hookRecv at: 0x%08X\n", hookRecvAddr);
+        DbgLog("\n=== Results ===\n");
+        DbgLog("Send call sites found & patched: %d\n", totalSendSites);
+        DbgLog("Recv call sites found & patched: %d\n", totalRecvSites);
+        DbgLog("System DLL bytes modified: ZERO\n");
+        DbgLog("IAT entries modified: ZERO\n");
 
-        // Dump first bytes of hook function to verify it's real code
-        HexDump(hookSendAddr, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("hookSend bytes: %s\n", hexBuf);
-        HexDump(hookRecvAddr, 16, hexBuf, sizeof(hexBuf));
-        DbgLog("hookRecv bytes: %s\n", hexBuf);
+        if (totalSendSites == 0 && totalRecvSites == 0) {
+            DbgLog("\nWARNING: No call sites found!\n");
+            DbgLog("The game might use indirect calls (MOV reg, [IAT]; CALL reg)\n");
+            DbgLog("or the code sections might be encrypted.\n");
 
-        // Pre-hook log to file
-        RawLog("=== v6 Hook Runtime Log ===\n");
-        RawLogHex("Mode: ", (DWORD)mode);
-        RawLogHex("g_origSend: ", (DWORD)g_origSend);
-        RawLogHex("g_origRecv: ", (DWORD)g_origRecv);
-        RawLog("Hooks about to be activated...\n");
+            // Try alternative: scan for MOV reg, [IAT_addr] patterns
+            // MOV EAX, [0x00C53610] = A1 10 36 C5 00 (5 bytes)
+            // MOV ECX, [0x00C53610] = 8B 0D 10 36 C5 00 (6 bytes)
+            // MOV EDX, [0x00C53610] = 8B 15 10 36 C5 00 (6 bytes)
+            DbgLog("\nSearching for indirect call patterns (MOV reg, [IAT])...\n");
 
-        DbgLog("\nApplying hot-patches...\n");
+            for (WORD i = 0; i < numSections; i++) {
+                DWORD secStart = (DWORD)hGame + sections[i].VirtualAddress;
+                DWORD secSize = sections[i].Misc.VirtualSize;
+                if (!(sections[i].Characteristics & IMAGE_SCN_MEM_READ)) continue;
 
-        bool sendOk = ApplyHotPatch(sendFuncAddr, hookSendAddr, sendOrigPad, sendOrigHead, "send");
-        bool recvOk = ApplyHotPatch(recvFuncAddr, hookRecvAddr, recvOrigPad, recvOrigHead, "recv");
+                uint8_t* base = (uint8_t*)secStart;
+                for (DWORD j = 0; j + 6 <= secSize; j++) {
+                    // Check for A1 [IAT_SEND] (MOV EAX, [0x00C53610])
+                    if (base[j] == 0xA1 && *(DWORD*)(base + j + 1) == KO::IAT::WS_SEND) {
+                        DbgLog("  MOV EAX, [IAT_send] at 0x%08X\n", secStart + j);
+                    }
+                    if (base[j] == 0xA1 && *(DWORD*)(base + j + 1) == KO::IAT::WS_RECV) {
+                        DbgLog("  MOV EAX, [IAT_recv] at 0x%08X\n", secStart + j);
+                    }
+                    // Check for 8B xx [IAT] (MOV reg, [0x00C53610])
+                    if (base[j] == 0x8B && (base[j+1] & 0xC7) == 0x05) {
+                        DWORD target = *(DWORD*)(base + j + 2);
+                        if (target == KO::IAT::WS_SEND) {
+                            DbgLog("  MOV r32, [IAT_send] at 0x%08X (reg=%02X)\n",
+                                secStart + j, base[j+1]);
+                        }
+                        if (target == KO::IAT::WS_RECV) {
+                            DbgLog("  MOV r32, [IAT_recv] at 0x%08X (reg=%02X)\n",
+                                secStart + j, base[j+1]);
+                        }
+                    }
+                    // Check for FF 15 with ANY IAT in wsock32 range
+                    if (base[j] == 0xFF && base[j+1] == 0x15) {
+                        DWORD target = *(DWORD*)(base + j + 2);
+                        if (target >= 0x00C53600 && target <= 0x00C53650) {
+                            DbgLog("  CALL [0x%08X] at 0x%08X\n", target, secStart + j);
+                        }
+                    }
+                }
+            }
 
-        // Post-patch verification
-        HexDump(sendFuncAddr, 8, hexBuf, sizeof(hexBuf));
-        DbgLog("send now: %s\n", hexBuf);
-        HexDump(recvFuncAddr, 8, hexBuf, sizeof(hexBuf));
-        DbgLog("recv now: %s\n", hexBuf);
+            return false;
+        }
 
-        DbgLog("\nResult: send=%s recv=%s\n", sendOk ? "OK" : "FAIL", recvOk ? "OK" : "FAIL");
-        DbgLog("=== Hook Install Complete (Mode %d) ===\n", mode);
+        // Pre-activate log
+        RawLog("=== v7 Hook Runtime Log ===\n");
+        RawLogHex("Send call sites: ", (DWORD)totalSendSites);
+        RawLogHex("Recv call sites: ", (DWORD)totalRecvSites);
+        RawLogHex("realSend: ", (DWORD)realSend);
+        RawLogHex("realRecv: ", (DWORD)realRecv);
+        RawLog("Call-site hooks ACTIVE\n");
 
-        return sendOk && recvOk;
+        DbgLog("=== Hook Install Complete (v7 Call-Site) ===\n");
+        return true;
     }
 
     // ---- Remove Hooks ----
     inline void RemoveNetworkHooks() {
-        if (sendFuncAddr)
-            RestoreHotPatch(sendFuncAddr, sendOrigPad, sendOrigHead);
-        if (recvFuncAddr)
-            RestoreHotPatch(recvFuncAddr, recvOrigPad, recvOrigHead);
-        if (sendTrampoline) { VirtualFree(sendTrampoline, 0, MEM_RELEASE); sendTrampoline = nullptr; }
-        if (recvTrampoline) { VirtualFree(recvTrampoline, 0, MEM_RELEASE); recvTrampoline = nullptr; }
-        g_origSend = nullptr;
-        g_origRecv = nullptr;
-        oSend = nullptr;
-        oRecv = nullptr;
+        for (auto& cs : sendCallSites)
+            RestoreCallSite(cs.address, cs.origBytes);
+        for (auto& cs : recvCallSites)
+            RestoreCallSite(cs.address, cs.origBytes);
+        sendCallSites.clear();
+        recvCallSites.clear();
+        realSend = nullptr;
+        realRecv = nullptr;
         if (logFile) { fclose(logFile); logFile = nullptr; }
         if (hHookLog != INVALID_HANDLE_VALUE) { CloseHandle(hHookLog); hHookLog = INVALID_HANDLE_VALUE; }
     }
@@ -474,8 +463,9 @@ namespace Hooks {
     // ---- Get hook stats ----
     inline void GetHookStats(char* buf, int bufSize) {
         sprintf_s(buf, bufSize,
-            "Mode %ld | Send: %ld (crash: %ld) | Recv: %ld (crash: %ld)",
-            hookMode, sendHookCount, sendCrashCount, recvHookCount, recvCrashCount);
+            "Call-sites: send=%zu recv=%zu | Calls: send=%ld recv=%ld",
+            sendCallSites.size(), recvCallSites.size(),
+            sendHookCount, recvHookCount);
     }
 
     // ---- IAT Hook Helper (for DefenderBypass) ----
