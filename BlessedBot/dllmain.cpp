@@ -231,7 +231,11 @@ void OnTestReadClick() {
 
 // ---- Main bot thread ----
 void BotThread() {
-    Sleep(2000);
+    // FIRST: Hide our DLL immediately (before anything else!)
+    // This minimizes the window where KODefender can spot us
+    Defender::EarlyStealth(g_hModule);
+
+    Sleep(1000); // Reduced from 2s - we're already hidden
 
     BotUI::Create((HINSTANCE)g_hModule);
 
@@ -241,26 +245,25 @@ void BotThread() {
     BotUI::onDumpClick = OnDumpClick;
     BotUI::onTestReadClick = OnTestReadClick;
 
-    BotUI::Log("=== BlessedKO Bot v8 - Indirect Call-Site ===");
-    BotUI::Log("Patches MOV reg,[IAT] -> MOV reg,hook");
-    BotUI::Log("=============================================");
+    BotUI::Log("=== BlessedKO Bot v8.2 ===");
+    BotUI::Log("Network: MOV reg,[IAT] indirect patching");
+    BotUI::Log("Stealth: PEB unlink + PE erase (auto at load)");
+    BotUI::Log("==========================================");
     BotUI::Log("");
-    BotUI::Log("v7 found: Game uses MOV reg,[IAT]; CALL reg");
-    BotUI::Log("v8 fix: Replace the MOV to load our hook addr");
-    BotUI::Log("No DLL bytes or IAT entries modified!");
+    BotUI::Log("[+] DLL auto-hidden from module lists at load!");
+    BotUI::Log("[+] PE header erased - no MZ/PE signatures");
     BotUI::Log("");
     BotUI::Log("Instructions:");
-    BotUI::Log("1. Click 'Bypass Defender' first");
-    BotUI::Log("2. Click 'Hook Net' to patch indirect calls");
+    BotUI::Log("1. Click 'Bypass Defender' (clears debug flags)");
+    BotUI::Log("2. Click 'Hook Net' to capture packets");
     BotUI::Log("3. Play normally, then 'Dump Packets'");
     BotUI::Log("");
-    BotUI::Log("[+] Bot DLL loaded successfully!");
 
     char buf[128];
     sprintf_s(buf, "[+] DLL base: 0x%08X", (DWORD)g_hModule);
     BotUI::Log(buf);
 
-    BotUI::SetStatus("Status: Ready - bypass defender first!");
+    BotUI::SetStatus("Status: Stealth active - bypass defender next");
 
     BotUI::MessageLoop();
 }
