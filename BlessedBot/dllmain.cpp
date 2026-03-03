@@ -13,7 +13,7 @@
 
 // ============================================================
 // BlessedKO Bot - DLL Entry Point
-// v7: Call-site hooking (no system DLL modifications)
+// v8: Indirect call-site hooking (MOV reg,[IAT] patching)
 // ============================================================
 
 static HMODULE g_hModule = nullptr;
@@ -66,8 +66,8 @@ void OnHookClick() {
         return;
     }
 
-    BotUI::Log("[*] Installing hooks v7 (call-site patching)...");
-    BotUI::Log("[*] Strategy: Patch CALL instructions in game code");
+    BotUI::Log("[*] Installing hooks v8 (indirect call-site)...");
+    BotUI::Log("[*] Strategy: Patch MOV reg,[IAT] in game code");
     BotUI::Log("[*] System DLL bytes: UNTOUCHED");
     BotUI::Log("[*] IAT entries: UNTOUCHED");
     BotUI::Log("");
@@ -76,22 +76,27 @@ void OnHookClick() {
         g_hooksInstalled = true;
         ShowDebugInfo("[*]");
 
+        // Count send vs recv patches
+        size_t sendPatches = 0, recvPatches = 0;
+        for (auto& site : Hooks::patchedSites) {
+            if (site.isSend) sendPatches++;
+            else recvPatches++;
+        }
+
         char msg[256];
-        sprintf_s(msg, "[+] Hooks active! %zu send + %zu recv call sites patched",
-            Hooks::sendCallSites.size(), Hooks::recvCallSites.size());
+        sprintf_s(msg, "[+] Hooks active! %zu send + %zu recv MOV sites patched",
+            sendPatches, recvPatches);
         BotUI::Log(msg);
         BotUI::Log("[+] wsock32/ws2_32 bytes: UNMODIFIED (KODefender safe!)");
+        BotUI::Log("[+] IAT entries: UNMODIFIED");
         BotUI::Log("[+] Packet capture is LIVE");
-        BotUI::SetStatus("Status: Hooks active (v7 call-site)");
+        BotUI::SetStatus("Status: Hooks active (v8 indirect)");
     }
     else {
-        BotUI::Log("[-] No call sites found - see debug log for scan results");
+        BotUI::Log("[-] No indirect call sites found!");
         ShowDebugInfo("[-]");
         BotUI::Log("");
-        BotUI::Log("[!] If 0 call sites found, the game might use:");
-        BotUI::Log("    - Indirect calls (MOV reg, [IAT]; CALL reg)");
-        BotUI::Log("    - Encrypted code sections (runtime unpacker)");
-        BotUI::Log("    Check BlessedBot_debug.log for alternative patterns found");
+        BotUI::Log("[!] Check BlessedBot_debug.log for scan details");
         BotUI::SetStatus("Status: Hook failed - check logs");
     }
 }
@@ -233,16 +238,17 @@ void BotThread() {
     BotUI::onDumpClick = OnDumpClick;
     BotUI::onTestReadClick = OnTestReadClick;
 
-    BotUI::Log("=== BlessedKO Bot v7 - Call-Site Hooks ===");
-    BotUI::Log("No system DLL modifications!");
-    BotUI::Log("==========================================");
+    BotUI::Log("=== BlessedKO Bot v8 - Indirect Call-Site ===");
+    BotUI::Log("Patches MOV reg,[IAT] -> MOV reg,hook");
+    BotUI::Log("=============================================");
     BotUI::Log("");
-    BotUI::Log("v6 proved: KODefender checks send/recv bytes");
-    BotUI::Log("v7 fix: Hook the game's CALL instructions instead");
+    BotUI::Log("v7 found: Game uses MOV reg,[IAT]; CALL reg");
+    BotUI::Log("v8 fix: Replace the MOV to load our hook addr");
+    BotUI::Log("No DLL bytes or IAT entries modified!");
     BotUI::Log("");
     BotUI::Log("Instructions:");
     BotUI::Log("1. Click 'Bypass Defender' first");
-    BotUI::Log("2. Click 'Hook Net' to install call-site hooks");
+    BotUI::Log("2. Click 'Hook Net' to patch indirect calls");
     BotUI::Log("3. Play normally, then 'Dump Packets'");
     BotUI::Log("");
     BotUI::Log("[+] Bot DLL loaded successfully!");

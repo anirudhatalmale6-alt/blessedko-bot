@@ -8,25 +8,24 @@
 #include "../Common/KOStructs.h"
 
 // ============================================================
-// Hooks v7 - Call-Site Hooking
+// Hooks v8 - Indirect Call-Site Hooking
 //
-// v6 Mode 0 (NAKED passthrough, literally one JMP instruction)
-// STILL crashed. This proves KODefender has a function-byte
-// integrity check on wsock32/ws2_32 send/recv.
+// v7 scan found the game uses INDIRECT calls for send/recv:
+//   0x004A5C13: MOV ESI, [0x00C53610]  ; load send ptr into ESI
+//               ... CALL ESI            ; call send through register
+//   0x004A6E44: MOV EBX, [0x00C53620]  ; load recv ptr into EBX
+//               ... CALL EBX            ; call recv through register
 //
-// v7 Solution: DON'T modify system DLL bytes at all!
-// Instead, find the game's CALL DWORD PTR [IAT_send] instructions
-// in KnightOnLine.exe and redirect THOSE to our hooks.
+// v8 Patch: Replace MOV reg, [IAT_addr] with MOV reg, hookAddr
+//   Original (6 bytes): 8B 35 10 36 C5 00  = MOV ESI, [0x00C53610]
+//   Patched  (6 bytes): BE [hkSend addr] 90 = MOV ESI, hkSend; NOP
 //
-// The game code does: CALL DWORD PTR [0x00C53610]  (FF 15 10 36 C5 00)
-// We replace with:    CALL our_hkSend; NOP         (E8 xx xx xx xx 90)
+// The register gets loaded with OUR function instead of real send.
+// When game does CALL ESI, it calls our hook. Our hook calls real
+// send/recv directly (unmodified system functions).
 //
-// KODefender checks:
-//   - IAT entries (v1 "Cheat Detected")
-//   - Function bytes of send/recv (v2-v6 silent crash)
-//   - But NOT every CALL instruction in the game code!
-//
-// Our hook calls real send/recv directly (they're UNMODIFIED).
+// Nothing modified: IAT entries, wsock32 bytes, ws2_32 bytes.
+// Only 6 bytes changed in game code at each site.
 // ============================================================
 
 namespace Hooks {
@@ -34,19 +33,20 @@ namespace Hooks {
     typedef int (WINAPI* tSend)(SOCKET s, const char* buf, int len, int flags);
     typedef int (WINAPI* tRecv)(SOCKET s, char* buf, int len, int flags);
 
-    // Real function pointers (read from IAT before any modification)
+    // Real function pointers (saved from IAT before patching)
     inline tSend realSend = nullptr;
     inline tRecv realRecv = nullptr;
 
     inline volatile SOCKET gameSocket = INVALID_SOCKET;
 
-    // Call site tracking
-    struct CallSite {
-        DWORD address;        // Address of the CALL instruction
-        uint8_t origBytes[6]; // Original 6 bytes (FF 15 xx xx xx xx)
+    // Patched sites tracking
+    struct PatchSite {
+        DWORD address;
+        uint8_t origBytes[6];
+        uint8_t reg;          // Register number (0=EAX..7=EDI)
+        bool isSend;          // true=send, false=recv
     };
-    inline std::vector<CallSite> sendCallSites;
-    inline std::vector<CallSite> recvCallSites;
+    inline std::vector<PatchSite> patchedSites;
 
     // Hook counters
     inline volatile LONG sendHookCount = 0;
@@ -133,8 +133,8 @@ namespace Hooks {
 
     // ================================================================
     // HOOK FUNCTIONS
-    // These are proper __stdcall functions called from patched CALL sites.
-    // They call the REAL send/recv (unmodified system functions).
+    // Called via register (CALL ESI / CALL EBX) after our patch.
+    // Must be __stdcall to match original send/recv calling convention.
     // ================================================================
 
     __declspec(noinline) static int __stdcall hkSend(SOCKET s, const char* buf, int len, int flags) {
@@ -143,7 +143,6 @@ namespace Hooks {
         if (gameSocket == INVALID_SOCKET)
             gameSocket = s;
 
-        // Log first call
         if (count == 1) {
             RawLog("=== hkSend ENTERED (first call) ===\n");
             RawLogHex("  socket: ", (DWORD)s);
@@ -169,7 +168,7 @@ namespace Hooks {
             if (!allow) return len;
         }
 
-        // Call REAL send (unmodified function!)
+        // Call REAL send (completely unmodified system function!)
         return realSend(s, buf, len, flags);
     }
 
@@ -183,7 +182,7 @@ namespace Hooks {
             RawLogHex("  realRecv: ", (DWORD)realRecv);
         }
 
-        // Call REAL recv (unmodified function!)
+        // Call REAL recv (completely unmodified!)
         int result = realRecv(s, buf, len, flags);
 
         if (result > 0) {
@@ -207,63 +206,83 @@ namespace Hooks {
     }
 
     // ================================================================
-    // CALL-SITE SCANNER & PATCHER
-    // Finds CALL DWORD PTR [IAT_addr] instructions in game code
-    // and replaces them with CALL our_hook + NOP
+    // INDIRECT CALL-SITE SCANNER & PATCHER
     // ================================================================
 
-    // Scan a memory range for a 6-byte pattern: FF 15 [4-byte LE addr]
-    inline std::vector<DWORD> FindCallSites(DWORD startAddr, DWORD size, DWORD iatAddr) {
-        std::vector<DWORD> results;
-        uint8_t pattern[6];
-        pattern[0] = 0xFF;
-        pattern[1] = 0x15;
-        *(DWORD*)(pattern + 2) = iatAddr;
+    // Register names for logging
+    inline const char* RegName(uint8_t reg) {
+        const char* names[] = { "EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI" };
+        return reg < 8 ? names[reg] : "???";
+    }
+
+    // Scan for MOV r32, [iatAddr] patterns and patch them
+    inline int ScanAndPatchIndirect(DWORD startAddr, DWORD size,
+        DWORD iatAddr, DWORD hookAddr, bool isSend, const char* name) {
 
         uint8_t* base = (uint8_t*)startAddr;
+        int count = 0;
+
         for (DWORD i = 0; i + 6 <= size; i++) {
-            if (memcmp(base + i, pattern, 6) == 0) {
-                results.push_back(startAddr + i);
+            bool found = false;
+            uint8_t reg = 0;
+            int instrLen = 0;
+
+            // Pattern 1: A1 [iatAddr] = MOV EAX, [addr] (5 bytes)
+            if (base[i] == 0xA1 && *(DWORD*)(base + i + 1) == iatAddr) {
+                found = true;
+                reg = 0; // EAX
+                instrLen = 5;
             }
+            // Pattern 2: 8B xx [iatAddr] = MOV r32, [addr] (6 bytes)
+            // ModR/M byte: mod=00, reg=r, r/m=101 (disp32)
+            // So byte & 0xC7 must equal 0x05
+            else if (base[i] == 0x8B && (base[i + 1] & 0xC7) == 0x05
+                && *(DWORD*)(base + i + 2) == iatAddr) {
+                found = true;
+                reg = (base[i + 1] >> 3) & 7;
+                instrLen = 6;
+            }
+
+            if (!found) continue;
+
+            DWORD addr = startAddr + i;
+            DbgLog("  %s: MOV %s, [0x%08X] at 0x%08X (%d bytes)\n",
+                name, RegName(reg), iatAddr, addr, instrLen);
+
+            // Backup original bytes
+            PatchSite site;
+            site.address = addr;
+            memcpy(site.origBytes, base + i, 6);
+            site.reg = reg;
+            site.isSend = isSend;
+
+            // Patch: MOV reg, imm32 = (0xB8 + reg) [4-byte imm]
+            // This is 5 bytes. If original was 6 bytes, add NOP.
+            // If original was 5 bytes (A1), exact fit.
+            DWORD oldProt;
+            if (!VirtualProtect(base + i, 6, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                DbgLog("    FAILED: VirtualProtect error %d\n", GetLastError());
+                continue;
+            }
+
+            base[i] = 0xB8 + reg;           // MOV reg, imm32
+            *(DWORD*)(base + i + 1) = hookAddr;
+            if (instrLen == 6)
+                base[i + 5] = 0x90;          // NOP for 6-byte instructions
+
+            VirtualProtect(base + i, 6, oldProt, &oldProt);
+            FlushInstructionCache(GetCurrentProcess(), base + i, 6);
+
+            // Log patched bytes
+            DbgLog("    Patched: %02X %02X %02X %02X %02X %02X (MOV %s, 0x%08X)\n",
+                base[i], base[i + 1], base[i + 2], base[i + 3], base[i + 4], base[i + 5],
+                RegName(reg), hookAddr);
+
+            patchedSites.push_back(site);
+            count++;
         }
-        return results;
-    }
 
-    // Patch a CALL site: replace FF 15 xx xx xx xx with E8 rel32 90
-    inline bool PatchCallSite(DWORD callAddr, DWORD hookFunc, uint8_t* backupBytes) {
-        uint8_t* p = (uint8_t*)callAddr;
-
-        // Backup original 6 bytes
-        memcpy(backupBytes, p, 6);
-
-        // Calculate relative offset for E8 CALL
-        // E8 is 5 bytes, relative offset is from end of instruction (callAddr + 5)
-        int32_t rel = (int32_t)(hookFunc - (callAddr + 5));
-
-        DWORD oldProt;
-        if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldProt))
-            return false;
-
-        p[0] = 0xE8;                  // CALL rel32
-        *(int32_t*)(p + 1) = rel;     // relative offset
-        p[5] = 0x90;                  // NOP (fill remaining byte)
-
-        VirtualProtect(p, 6, oldProt, &oldProt);
-        FlushInstructionCache(GetCurrentProcess(), p, 6);
-
-        return true;
-    }
-
-    // Restore a patched CALL site
-    inline bool RestoreCallSite(DWORD callAddr, uint8_t* origBytes) {
-        uint8_t* p = (uint8_t*)callAddr;
-        DWORD oldProt;
-        if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldProt))
-            return false;
-        memcpy(p, origBytes, 6);
-        VirtualProtect(p, 6, oldProt, &oldProt);
-        FlushInstructionCache(GetCurrentProcess(), p, 6);
-        return true;
+        return count;
     }
 
     // ---- Install Hooks ----
@@ -271,33 +290,33 @@ namespace Hooks {
         debugPos = 0;
         memset(debugInfo, 0, sizeof(debugInfo));
 
-        DbgLog("=== Hook Install v7 (Call-Site Hooking) ===\n");
-        DbgLog("Strategy: Patch game's CALL instructions, NOT system DLL bytes\n\n");
+        DbgLog("=== Hook Install v8 (Indirect Call-Site) ===\n");
+        DbgLog("Patch MOV reg,[IAT] to MOV reg,hookAddr\n\n");
 
-        // Step 1: Get real function pointers from IAT
+        // Step 1: Save real function pointers from IAT
         DWORD iatSendPtr = *(DWORD*)KO::IAT::WS_SEND;
         DWORD iatRecvPtr = *(DWORD*)KO::IAT::WS_RECV;
 
         realSend = (tSend)iatSendPtr;
         realRecv = (tRecv)iatRecvPtr;
 
-        DbgLog("IAT send entry at 0x%08X -> 0x%08X\n", KO::IAT::WS_SEND, iatSendPtr);
-        DbgLog("IAT recv entry at 0x%08X -> 0x%08X\n", KO::IAT::WS_RECV, iatRecvPtr);
-        DbgLog("realSend = 0x%08X\n", (DWORD)realSend);
-        DbgLog("realRecv = 0x%08X\n", (DWORD)realRecv);
+        DbgLog("IAT send [0x%08X] -> 0x%08X\n", KO::IAT::WS_SEND, iatSendPtr);
+        DbgLog("IAT recv [0x%08X] -> 0x%08X\n", KO::IAT::WS_RECV, iatRecvPtr);
 
-        // Verify real functions are intact (should start with 8B FF)
-        char hexBuf[64];
-        uint8_t* sendBytes = (uint8_t*)iatSendPtr;
-        uint8_t* recvBytes = (uint8_t*)iatRecvPtr;
-        sprintf_s(hexBuf, "%02X %02X %02X %02X %02X",
-            sendBytes[0], sendBytes[1], sendBytes[2], sendBytes[3], sendBytes[4]);
-        DbgLog("send function bytes: %s (should be 8B FF 55 8B EC)\n", hexBuf);
-        sprintf_s(hexBuf, "%02X %02X %02X %02X %02X",
-            recvBytes[0], recvBytes[1], recvBytes[2], recvBytes[3], recvBytes[4]);
-        DbgLog("recv function bytes: %s (should be 8B FF 55 8B EC)\n", hexBuf);
+        // Verify real functions are untouched
+        uint8_t* sb = (uint8_t*)iatSendPtr;
+        uint8_t* rb = (uint8_t*)iatRecvPtr;
+        DbgLog("send bytes: %02X %02X %02X %02X %02X (8B FF 55 8B EC = OK)\n",
+            sb[0], sb[1], sb[2], sb[3], sb[4]);
+        DbgLog("recv bytes: %02X %02X %02X %02X %02X (8B FF 55 8B EC = OK)\n",
+            rb[0], rb[1], rb[2], rb[3], rb[4]);
 
-        // Step 2: Get KnightOnLine.exe module info
+        DWORD hookSendAddr = (DWORD)&hkSend;
+        DWORD hookRecvAddr = (DWORD)&hkRecv;
+        DbgLog("hkSend: 0x%08X\n", hookSendAddr);
+        DbgLog("hkRecv: 0x%08X\n", hookRecvAddr);
+
+        // Step 2: Get game module sections
         HMODULE hGame = GetModuleHandleA(nullptr);
         if (!hGame) {
             DbgLog("FAIL: Cannot get game module\n");
@@ -309,151 +328,62 @@ namespace Hooks {
         PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
         WORD numSections = nt->FileHeader.NumberOfSections;
 
-        DbgLog("Game module: 0x%08X, %d sections\n", (DWORD)hGame, numSections);
+        // Step 3: Scan all readable sections for MOV reg, [IAT_send/recv]
+        DbgLog("\nScanning for MOV reg, [IAT_send/recv]...\n");
 
-        // Step 3: Scan ALL executable sections for CALL [IAT_send] and CALL [IAT_recv]
-        DWORD hookSendAddr = (DWORD)&hkSend;
-        DWORD hookRecvAddr = (DWORD)&hkRecv;
-        DbgLog("hkSend at: 0x%08X\n", hookSendAddr);
-        DbgLog("hkRecv at: 0x%08X\n", hookRecvAddr);
-
-        int totalSendSites = 0;
-        int totalRecvSites = 0;
-
-        DbgLog("\nScanning sections for CALL [IAT] patterns...\n");
+        int totalSend = 0, totalRecv = 0;
 
         for (WORD i = 0; i < numSections; i++) {
             DWORD secStart = (DWORD)hGame + sections[i].VirtualAddress;
             DWORD secSize = sections[i].Misc.VirtualSize;
-            DWORD secChars = sections[i].Characteristics;
+            if (!(sections[i].Characteristics & IMAGE_SCN_MEM_READ)) continue;
+
             char secName[9] = {};
             memcpy(secName, sections[i].Name, 8);
 
-            // Only scan sections that contain code or are readable
-            bool isCode = (secChars & IMAGE_SCN_MEM_EXECUTE) != 0;
-            bool isReadable = (secChars & IMAGE_SCN_MEM_READ) != 0;
-
-            DbgLog("  Section '%s': 0x%08X size=0x%X [%s%s]\n",
-                secName, secStart, secSize,
-                isCode ? "CODE " : "",
-                isReadable ? "READ" : "");
-
-            if (!isReadable) continue;  // Can't scan unreadable sections
-
-            // Search for CALL DWORD PTR [WS_SEND] = FF 15 10 36 C5 00
-            auto sendSites = FindCallSites(secStart, secSize, KO::IAT::WS_SEND);
-            for (DWORD addr : sendSites) {
-                DbgLog("    SEND call site at 0x%08X\n", addr);
-                CallSite cs;
-                cs.address = addr;
-                if (PatchCallSite(addr, hookSendAddr, cs.origBytes)) {
-                    sendCallSites.push_back(cs);
-                    totalSendSites++;
-                    // Log patched bytes
-                    uint8_t* p = (uint8_t*)addr;
-                    DbgLog("      Patched: %02X %02X %02X %02X %02X %02X\n",
-                        p[0], p[1], p[2], p[3], p[4], p[5]);
-                }
-                else {
-                    DbgLog("      FAILED to patch!\n");
-                }
-            }
-
-            // Search for CALL DWORD PTR [WS_RECV] = FF 15 20 36 C5 00
-            auto recvSites = FindCallSites(secStart, secSize, KO::IAT::WS_RECV);
-            for (DWORD addr : recvSites) {
-                DbgLog("    RECV call site at 0x%08X\n", addr);
-                CallSite cs;
-                cs.address = addr;
-                if (PatchCallSite(addr, hookRecvAddr, cs.origBytes)) {
-                    recvCallSites.push_back(cs);
-                    totalRecvSites++;
-                    uint8_t* p = (uint8_t*)addr;
-                    DbgLog("      Patched: %02X %02X %02X %02X %02X %02X\n",
-                        p[0], p[1], p[2], p[3], p[4], p[5]);
-                }
-                else {
-                    DbgLog("      FAILED to patch!\n");
-                }
-            }
+            totalSend += ScanAndPatchIndirect(secStart, secSize,
+                KO::IAT::WS_SEND, hookSendAddr, true, "send");
+            totalRecv += ScanAndPatchIndirect(secStart, secSize,
+                KO::IAT::WS_RECV, hookRecvAddr, false, "recv");
         }
 
         DbgLog("\n=== Results ===\n");
-        DbgLog("Send call sites found & patched: %d\n", totalSendSites);
-        DbgLog("Recv call sites found & patched: %d\n", totalRecvSites);
-        DbgLog("System DLL bytes modified: ZERO\n");
+        DbgLog("Send MOV patches: %d\n", totalSend);
+        DbgLog("Recv MOV patches: %d\n", totalRecv);
+        DbgLog("wsock32/ws2_32 bytes modified: ZERO\n");
         DbgLog("IAT entries modified: ZERO\n");
+        DbgLog("Game code bytes modified: %d (send) + %d (recv) = %d total\n",
+            totalSend * 6, totalRecv * 6, (totalSend + totalRecv) * 6);
 
-        if (totalSendSites == 0 && totalRecvSites == 0) {
-            DbgLog("\nWARNING: No call sites found!\n");
-            DbgLog("The game might use indirect calls (MOV reg, [IAT]; CALL reg)\n");
-            DbgLog("or the code sections might be encrypted.\n");
-
-            // Try alternative: scan for MOV reg, [IAT_addr] patterns
-            // MOV EAX, [0x00C53610] = A1 10 36 C5 00 (5 bytes)
-            // MOV ECX, [0x00C53610] = 8B 0D 10 36 C5 00 (6 bytes)
-            // MOV EDX, [0x00C53610] = 8B 15 10 36 C5 00 (6 bytes)
-            DbgLog("\nSearching for indirect call patterns (MOV reg, [IAT])...\n");
-
-            for (WORD i = 0; i < numSections; i++) {
-                DWORD secStart = (DWORD)hGame + sections[i].VirtualAddress;
-                DWORD secSize = sections[i].Misc.VirtualSize;
-                if (!(sections[i].Characteristics & IMAGE_SCN_MEM_READ)) continue;
-
-                uint8_t* base = (uint8_t*)secStart;
-                for (DWORD j = 0; j + 6 <= secSize; j++) {
-                    // Check for A1 [IAT_SEND] (MOV EAX, [0x00C53610])
-                    if (base[j] == 0xA1 && *(DWORD*)(base + j + 1) == KO::IAT::WS_SEND) {
-                        DbgLog("  MOV EAX, [IAT_send] at 0x%08X\n", secStart + j);
-                    }
-                    if (base[j] == 0xA1 && *(DWORD*)(base + j + 1) == KO::IAT::WS_RECV) {
-                        DbgLog("  MOV EAX, [IAT_recv] at 0x%08X\n", secStart + j);
-                    }
-                    // Check for 8B xx [IAT] (MOV reg, [0x00C53610])
-                    if (base[j] == 0x8B && (base[j+1] & 0xC7) == 0x05) {
-                        DWORD target = *(DWORD*)(base + j + 2);
-                        if (target == KO::IAT::WS_SEND) {
-                            DbgLog("  MOV r32, [IAT_send] at 0x%08X (reg=%02X)\n",
-                                secStart + j, base[j+1]);
-                        }
-                        if (target == KO::IAT::WS_RECV) {
-                            DbgLog("  MOV r32, [IAT_recv] at 0x%08X (reg=%02X)\n",
-                                secStart + j, base[j+1]);
-                        }
-                    }
-                    // Check for FF 15 with ANY IAT in wsock32 range
-                    if (base[j] == 0xFF && base[j+1] == 0x15) {
-                        DWORD target = *(DWORD*)(base + j + 2);
-                        if (target >= 0x00C53600 && target <= 0x00C53650) {
-                            DbgLog("  CALL [0x%08X] at 0x%08X\n", target, secStart + j);
-                        }
-                    }
-                }
-            }
-
+        if (totalSend == 0 && totalRecv == 0) {
+            DbgLog("\nFAIL: No indirect call sites found!\n");
             return false;
         }
 
-        // Pre-activate log
-        RawLog("=== v7 Hook Runtime Log ===\n");
-        RawLogHex("Send call sites: ", (DWORD)totalSendSites);
-        RawLogHex("Recv call sites: ", (DWORD)totalRecvSites);
+        // Pre-activate runtime log
+        RawLog("=== v8 Hook Runtime Log ===\n");
+        RawLogHex("Send patches: ", (DWORD)totalSend);
+        RawLogHex("Recv patches: ", (DWORD)totalRecv);
         RawLogHex("realSend: ", (DWORD)realSend);
         RawLogHex("realRecv: ", (DWORD)realRecv);
-        RawLog("Call-site hooks ACTIVE\n");
+        RawLog("Hooks ACTIVE - waiting for first packet...\n");
 
-        DbgLog("=== Hook Install Complete (v7 Call-Site) ===\n");
+        DbgLog("\n=== Hook Install Complete (v8) ===\n");
         return true;
     }
 
     // ---- Remove Hooks ----
     inline void RemoveNetworkHooks() {
-        for (auto& cs : sendCallSites)
-            RestoreCallSite(cs.address, cs.origBytes);
-        for (auto& cs : recvCallSites)
-            RestoreCallSite(cs.address, cs.origBytes);
-        sendCallSites.clear();
-        recvCallSites.clear();
+        for (auto& site : patchedSites) {
+            uint8_t* p = (uint8_t*)site.address;
+            DWORD oldProt;
+            if (VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                memcpy(p, site.origBytes, 6);
+                VirtualProtect(p, 6, oldProt, &oldProt);
+                FlushInstructionCache(GetCurrentProcess(), p, 6);
+            }
+        }
+        patchedSites.clear();
         realSend = nullptr;
         realRecv = nullptr;
         if (logFile) { fclose(logFile); logFile = nullptr; }
@@ -463,9 +393,8 @@ namespace Hooks {
     // ---- Get hook stats ----
     inline void GetHookStats(char* buf, int bufSize) {
         sprintf_s(buf, bufSize,
-            "Call-sites: send=%zu recv=%zu | Calls: send=%ld recv=%ld",
-            sendCallSites.size(), recvCallSites.size(),
-            sendHookCount, recvHookCount);
+            "Patches: %zu sites | Calls: send=%ld recv=%ld",
+            patchedSites.size(), sendHookCount, recvHookCount);
     }
 
     // ---- IAT Hook Helper (for DefenderBypass) ----
