@@ -107,7 +107,9 @@ void OnBypassClick() {
         return;
     }
 
-    BotUI::Log("[*] Bypassing KODefender...");
+    BotUI::Log("[*] Bypassing KODefender (v2 zero-mod)...");
+    BotUI::Log("[*] Strategy: PEB stealth + VEH hardware breakpoints");
+    BotUI::Log("[*] KODefender code modified: ZERO bytes");
 
     HMODULE hDefender = GetModuleHandleA("KODefender.dll");
     if (!hDefender) {
@@ -117,12 +119,13 @@ void OnBypassClick() {
         return;
     }
 
-    BotUI::Log("[*] KODefender found, neutralizing...");
+    BotUI::Log("[*] KODefender found, applying stealth...");
 
     if (Defender::Install(g_hModule)) {
         g_defenderBypassed = true;
-        BotUI::Log("[+] Defender bypassed successfully");
-        BotUI::SetStatus("Status: Defender bypassed");
+        BotUI::Log("[+] Defender bypassed (zero-modification!)");
+        BotUI::Log("[+] PEB cleared + DLL hidden + PE erased + VEH active");
+        BotUI::SetStatus("Status: Stealth active (v2)");
     }
     else {
         BotUI::Log("[-] Bypass failed!");
