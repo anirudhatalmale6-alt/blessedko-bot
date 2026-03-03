@@ -8,15 +8,19 @@
 #include "../Common/KOStructs.h"
 
 // ============================================================
-// Hooks v5 - Hot-Patch Hooking + Crash Diagnostics
+// Hooks v6 - Progressive Diagnostic Build
 //
-// v4 hot-patch math verified correct, but still crashes on first
-// packet. v5 adds:
-// 1. FlushInstructionCache after all code modifications
-// 2. SEH wrapper around hook functions (catches crashes)
-// 3. Win32-level logging inside hooks (no CRT, crash-safe)
-// 4. Volatile function pointers to prevent optimizer issues
-// 5. Logs oSend/oRecv values from inside hook to verify routing
+// v5 showed: hot-patch install is 100% correct, but runtime crash
+// persists (even SEH didn't catch it). This suggests the crash
+// is either in the calling mechanism itself, or a stack overflow.
+//
+// v6 Strategy: THREE HOOK MODES tested progressively
+//   Mode 0: NAKED passthrough (just JMP to trampoline, zero code)
+//   Mode 1: Minimal __stdcall passthrough (one CALL, no extras)
+//   Mode 2: Full implementation (logging + packet capture + SEH)
+//
+// Start in Mode 0. If game survives, upgrade to Mode 1, then 2.
+// This binary search finds exactly what causes the crash.
 // ============================================================
 
 namespace Hooks {
@@ -24,7 +28,15 @@ namespace Hooks {
     typedef int (WINAPI* tSend)(SOCKET s, const char* buf, int len, int flags);
     typedef int (WINAPI* tRecv)(SOCKET s, char* buf, int len, int flags);
 
-    // Original function trampolines - VOLATILE to prevent optimizer caching
+    // Hook mode: 0=naked, 1=passthrough, 2=full
+    inline volatile LONG hookMode = 0;
+
+    // Trampoline pointers - used by naked asm hooks
+    // These MUST be simple globals (not volatile) for __asm access
+    inline tSend g_origSend = nullptr;
+    inline tRecv g_origRecv = nullptr;
+
+    // Also keep volatile versions for C++ code paths
     inline volatile tSend oSend = nullptr;
     inline volatile tRecv oRecv = nullptr;
 
@@ -40,7 +52,7 @@ namespace Hooks {
     inline uint8_t recvOrigPad[5] = {};
     inline uint8_t recvOrigHead[2] = {};
 
-    // Trampolines (allocated executable memory)
+    // Trampolines
     inline uint8_t* sendTrampoline = nullptr;
     inline uint8_t* recvTrampoline = nullptr;
 
@@ -71,7 +83,6 @@ namespace Hooks {
 
     inline void RawLogHex(const char* prefix, DWORD value) {
         char buf[80];
-        // Manual hex formatting (no CRT)
         const char* hex = "0123456789ABCDEF";
         int pos = 0;
         const char* p = prefix;
@@ -84,7 +95,7 @@ namespace Hooks {
         RawLog(buf);
     }
 
-    // ==== Install-time debug logging (CRT-based, for debugInfo UI) ====
+    // ==== Install-time debug logging ====
     inline FILE* logFile = nullptr;
     inline char debugInfo[4096] = {};
     inline int debugPos = 0;
@@ -112,7 +123,7 @@ namespace Hooks {
         va_end(args);
     }
 
-    // Packet log
+    // Packet log (used in Mode 2 only)
     struct PacketLog {
         bool     isSend;
         DWORD    timestamp;
@@ -127,15 +138,52 @@ namespace Hooks {
     inline PacketCallback onPacket = nullptr;
 
     inline int SendGamePacket(const uint8_t* data, int len) {
-        volatile tSend fn = oSend;
+        tSend fn = g_origSend;
         volatile SOCKET sock = gameSocket;
         if (fn && sock != INVALID_SOCKET)
             return fn(sock, (const char*)data, len, 0);
         return -1;
     }
 
-    // ==== Hook implementations (C++ internals) ====
-    __declspec(noinline) static int WINAPI hkSendInner(SOCKET s, const char* buf, int len, int flags) {
+    // ================================================================
+    // MODE 0: NAKED PASSTHROUGH (absolute minimum - just JMP forward)
+    // No prologue, no epilogue, no stack manipulation at all.
+    // If this crashes, the trampoline itself is broken.
+    // ================================================================
+#pragma warning(push)
+#pragma warning(disable: 4740) // inline asm suppresses global optimization
+    __declspec(naked) static void hkSendNaked() {
+        __asm {
+            jmp dword ptr [g_origSend]
+        }
+    }
+
+    __declspec(naked) static void hkRecvNaked() {
+        __asm {
+            jmp dword ptr [g_origRecv]
+        }
+    }
+#pragma warning(pop)
+
+    // ================================================================
+    // MODE 1: MINIMAL PASSTHROUGH (proper __stdcall, one CALL only)
+    // Tests that the calling convention is correct.
+    // If Mode 0 works but this crashes, it's a calling convention issue.
+    // ================================================================
+    __declspec(noinline) static int __stdcall hkSendMinimal(SOCKET s, const char* buf, int len, int flags) {
+        InterlockedIncrement(&sendHookCount);
+        return g_origSend(s, buf, len, flags);
+    }
+
+    __declspec(noinline) static int __stdcall hkRecvMinimal(SOCKET s, char* buf, int len, int flags) {
+        InterlockedIncrement(&recvHookCount);
+        return g_origRecv(s, buf, len, flags);
+    }
+
+    // ================================================================
+    // MODE 2: FULL IMPLEMENTATION (logging + packet capture + SEH)
+    // ================================================================
+    __declspec(noinline) static int __stdcall hkSendInner(SOCKET s, const char* buf, int len, int flags) {
         if (gameSocket == INVALID_SOCKET)
             gameSocket = s;
 
@@ -156,15 +204,11 @@ namespace Hooks {
             if (!allow) return len;
         }
 
-        // Read volatile pointer and call trampoline
-        volatile tSend fn = oSend;
-        return fn(s, buf, len, flags);
+        return g_origSend(s, buf, len, flags);
     }
 
-    __declspec(noinline) static int WINAPI hkRecvInner(SOCKET s, char* buf, int len, int flags) {
-        // Read volatile pointer and call trampoline
-        volatile tRecv fn = oRecv;
-        int result = fn(s, buf, len, flags);
+    __declspec(noinline) static int __stdcall hkRecvInner(SOCKET s, char* buf, int len, int flags) {
+        int result = g_origRecv(s, buf, len, flags);
 
         if (result > 0) {
             {
@@ -186,65 +230,25 @@ namespace Hooks {
         return result;
     }
 
-    // ==== SEH wrapper hooks (NO C++ objects - safe for __try/__except) ====
-    // These are the actual hook entry points. They log, then call the C++ inner function.
-    // If anything crashes, SEH catches it and calls original directly via trampoline.
-
-    __declspec(noinline) static int WINAPI hkSendImpl(SOCKET s, const char* buf, int len, int flags) {
-        LONG count = InterlockedIncrement(&sendHookCount);
-
-        // Log on first call only (to avoid flooding)
-        if (count == 1) {
-            RawLog("=== hkSendImpl ENTERED (first call) ===\n");
-            RawLogHex("  oSend = ", (DWORD)oSend);
-            RawLogHex("  sendTrampoline = ", (DWORD)sendTrampoline);
-            RawLogHex("  sendFuncAddr = ", sendFuncAddr);
-            RawLogHex("  socket = ", (DWORD)s);
-            RawLogHex("  buf = ", (DWORD)buf);
-            RawLogHex("  len = ", (DWORD)len);
-        }
-
+    __declspec(noinline) static int __stdcall hkSendFull(SOCKET s, const char* buf, int len, int flags) {
+        InterlockedIncrement(&sendHookCount);
         __try {
             return hkSendInner(s, buf, len, flags);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             InterlockedIncrement(&sendCrashCount);
-            if (sendCrashCount <= 3) {
-                RawLog("!!! hkSendImpl CRASHED - SEH caught !!!\n");
-                RawLogHex("  Exception at call #", (DWORD)count);
-                RawLogHex("  oSend = ", (DWORD)oSend);
-            }
-            // Fall back to calling trampoline directly
-            volatile tSend fn = oSend;
-            if (fn) return fn(s, buf, len, flags);
-            return -1;
+            return g_origSend(s, buf, len, flags);
         }
     }
 
-    __declspec(noinline) static int WINAPI hkRecvImpl(SOCKET s, char* buf, int len, int flags) {
-        LONG count = InterlockedIncrement(&recvHookCount);
-
-        if (count == 1) {
-            RawLog("=== hkRecvImpl ENTERED (first call) ===\n");
-            RawLogHex("  oRecv = ", (DWORD)oRecv);
-            RawLogHex("  recvTrampoline = ", (DWORD)recvTrampoline);
-            RawLogHex("  recvFuncAddr = ", recvFuncAddr);
-            RawLogHex("  socket = ", (DWORD)s);
-        }
-
+    __declspec(noinline) static int __stdcall hkRecvFull(SOCKET s, char* buf, int len, int flags) {
+        InterlockedIncrement(&recvHookCount);
         __try {
             return hkRecvInner(s, buf, len, flags);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             InterlockedIncrement(&recvCrashCount);
-            if (recvCrashCount <= 3) {
-                RawLog("!!! hkRecvImpl CRASHED - SEH caught !!!\n");
-                RawLogHex("  Exception at call #", (DWORD)count);
-                RawLogHex("  oRecv = ", (DWORD)oRecv);
-            }
-            volatile tRecv fn = oRecv;
-            if (fn) return fn(s, buf, len, flags);
-            return -1;
+            return g_origRecv(s, buf, len, flags);
         }
     }
 
@@ -261,18 +265,13 @@ namespace Hooks {
             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!tramp) return nullptr;
 
-        // MOV EDI, EDI (the original 2-byte NOP we're replacing)
         tramp[0] = 0x8B;
         tramp[1] = 0xFF;
-
-        // JMP to funcAddr + 2 (skip past our EB F9 short jmp)
         tramp[2] = 0xE9;
         DWORD jmpTarget = funcAddr + 2;
         *(int32_t*)(tramp + 3) = (int32_t)(jmpTarget - (DWORD)(tramp + 7));
 
-        // Flush instruction cache for trampoline
         FlushInstructionCache(GetCurrentProcess(), tramp, 16);
-
         return tramp;
     }
 
@@ -282,14 +281,12 @@ namespace Hooks {
 
         uint8_t* pFunc = (uint8_t*)funcAddr;
 
-        // Verify hot-patch prologue
         if (pFunc[0] != 0x8B || pFunc[1] != 0xFF) {
             DbgLog("%s: NOT hot-patchable (bytes: %02X %02X, expected 8B FF)\n",
                 name, pFunc[0], pFunc[1]);
             return false;
         }
 
-        // Check the 5 bytes before the function
         uint8_t* pPad = pFunc - 5;
         bool padOk = true;
         for (int i = 0; i < 5; i++) {
@@ -301,46 +298,29 @@ namespace Hooks {
 
         char hexBuf[64];
         HexDump((DWORD)pPad, 5, hexBuf, sizeof(hexBuf));
-        DbgLog("%s: padding bytes [-5]: %s (%s)\n", name, hexBuf, padOk ? "OK" : "NOT standard padding");
+        DbgLog("%s: padding [-5]: %s (%s)\n", name, hexBuf, padOk ? "OK" : "NOT standard");
 
-        if (!padOk) {
-            DbgLog("%s: WARNING - padding not standard, but proceeding anyway\n", name);
-        }
-
-        // Backup original bytes
         memcpy(backupPad, pPad, 5);
         memcpy(backupHead, pFunc, 2);
 
-        // Unprotect the 7-byte region: [funcAddr-5 ... funcAddr+1]
         DWORD oldProt;
         if (!VirtualProtect(pPad, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
             DbgLog("%s: VirtualProtect failed: %d\n", name, GetLastError());
             return false;
         }
 
-        // Step 1: Write JMP rel32 in the 5-byte padding BEFORE function
         pPad[0] = 0xE9;
         *(int32_t*)(pPad + 1) = (int32_t)(hookAddr - (DWORD)(pPad + 5));
 
-        // Step 2: Replace MOV EDI,EDI with JMP SHORT -7
-        // (JMP SHORT offset is relative to NEXT instruction = funcAddr+2)
-        // Target: funcAddr+2 + (-7) = funcAddr-5 = pPad
         pFunc[0] = 0xEB;
-        pFunc[1] = 0xF9;  // -7 signed
+        pFunc[1] = 0xF9;
 
-        // Restore original protection
         VirtualProtect(pPad, 7, oldProt, &oldProt);
-
-        // CRITICAL: Flush instruction cache so other CPUs/threads see new code
         FlushInstructionCache(GetCurrentProcess(), pPad, 7);
 
-        // Verify
         HexDump((DWORD)pPad, 7, hexBuf, sizeof(hexBuf));
         DbgLog("%s: patched [-5..+2]: %s\n", name, hexBuf);
-
-        // Also verify trampoline target
-        DbgLog("%s: hook target = 0x%08X, trampoline returns to = 0x%08X\n",
-            name, hookAddr, funcAddr + 2);
+        DbgLog("%s: hook -> 0x%08X, trampoline -> 0x%08X\n", name, hookAddr, funcAddr + 2);
 
         return true;
     }
@@ -363,13 +343,15 @@ namespace Hooks {
     }
 
     // ---- Install Hooks ----
-    inline bool InstallNetworkHooks() {
+    // mode: 0=naked, 1=minimal, 2=full
+    inline bool InstallNetworkHooks(int mode = 0) {
         debugPos = 0;
         memset(debugInfo, 0, sizeof(debugInfo));
+        hookMode = mode;
 
-        DbgLog("=== Hook Install v5 (Hot-Patch + SEH + Diagnostics) ===\n");
+        const char* modeNames[] = { "NAKED passthrough", "MINIMAL passthrough", "FULL (logging+SEH)" };
+        DbgLog("=== Hook Install v6 - Mode %d: %s ===\n", mode, modeNames[mode]);
 
-        // Get module handles
         HMODULE hWsock = GetModuleHandleA("wsock32.dll");
         if (!hWsock) hWsock = LoadLibraryA("wsock32.dll");
         HMODULE hWs2 = GetModuleHandleA("ws2_32.dll");
@@ -380,36 +362,20 @@ namespace Hooks {
         DbgLog("wsock32.dll at: 0x%08X\n", (DWORD)hWsock);
         DbgLog("ws2_32.dll at: 0x%08X\n", (DWORD)hWs2);
 
-        // Get export addresses
         DWORD wsockSend = (DWORD)GetProcAddress(hWsock, "send");
         DWORD wsockRecv = (DWORD)GetProcAddress(hWsock, "recv");
         DWORD ws2Send = hWs2 ? (DWORD)GetProcAddress(hWs2, "send") : 0;
-        DWORD ws2Recv = hWs2 ? (DWORD)GetProcAddress(hWs2, "recv") : 0;
 
         char hexBuf[128];
-
         HexDump(wsockSend, 16, hexBuf, sizeof(hexBuf));
         DbgLog("wsock32.send (0x%08X): %s\n", wsockSend, hexBuf);
         HexDump(wsockRecv, 16, hexBuf, sizeof(hexBuf));
         DbgLog("wsock32.recv (0x%08X): %s\n", wsockRecv, hexBuf);
 
-        if (ws2Send) {
-            HexDump(ws2Send, 16, hexBuf, sizeof(hexBuf));
-            DbgLog("ws2_32.send (0x%08X): %s\n", ws2Send, hexBuf);
-        }
-        if (ws2Recv) {
-            HexDump(ws2Recv, 16, hexBuf, sizeof(hexBuf));
-            DbgLog("ws2_32.recv (0x%08X): %s\n", ws2Recv, hexBuf);
-        }
-
         DbgLog("wsock32.send == ws2_32.send? %s\n", wsockSend == ws2Send ? "YES (forwarded)" : "NO");
-        DbgLog("wsock32.recv == ws2_32.recv? %s\n", wsockRecv == ws2Recv ? "YES (forwarded)" : "NO");
 
         sendFuncAddr = wsockSend;
         recvFuncAddr = wsockRecv;
-
-        DbgLog("\nHooking send at: 0x%08X\n", sendFuncAddr);
-        DbgLog("Hooking recv at: 0x%08X\n", recvFuncAddr);
 
         // Create trampolines
         sendTrampoline = CreateHotPatchTrampoline(sendFuncAddr);
@@ -420,69 +386,71 @@ namespace Hooks {
             return false;
         }
 
-        // Set originals to trampolines BEFORE patching
-        oSend = (tSend)sendTrampoline;
-        oRecv = (tRecv)recvTrampoline;
+        // Set BOTH volatile and non-volatile originals
+        g_origSend = (tSend)sendTrampoline;
+        g_origRecv = (tRecv)recvTrampoline;
+        oSend = g_origSend;
+        oRecv = g_origRecv;
 
-        DbgLog("send trampoline at: 0x%08X\n", (DWORD)sendTrampoline);
-        DbgLog("recv trampoline at: 0x%08X\n", (DWORD)recvTrampoline);
-        DbgLog("oSend = 0x%08X (should match send trampoline)\n", (DWORD)oSend);
-        DbgLog("oRecv = 0x%08X (should match recv trampoline)\n", (DWORD)oRecv);
+        DbgLog("send trampoline: 0x%08X\n", (DWORD)sendTrampoline);
+        DbgLog("recv trampoline: 0x%08X\n", (DWORD)recvTrampoline);
+        DbgLog("g_origSend: 0x%08X\n", (DWORD)g_origSend);
+        DbgLog("g_origRecv: 0x%08X\n", (DWORD)g_origRecv);
 
-        // Verify trampoline bytes
         HexDump((DWORD)sendTrampoline, 7, hexBuf, sizeof(hexBuf));
         DbgLog("send trampoline bytes: %s\n", hexBuf);
         HexDump((DWORD)recvTrampoline, 7, hexBuf, sizeof(hexBuf));
         DbgLog("recv trampoline bytes: %s\n", hexBuf);
 
-        // Get SEH wrapper hook addresses (NOT the inner functions)
-        DWORD hookSendAddr = (DWORD)&hkSendImpl;
-        DWORD hookRecvAddr = (DWORD)&hkRecvImpl;
-        DbgLog("hkSendImpl (SEH wrapper) at: 0x%08X\n", hookSendAddr);
-        DbgLog("hkRecvImpl (SEH wrapper) at: 0x%08X\n", hookRecvAddr);
-        DbgLog("hkSendInner at: 0x%08X\n", (DWORD)&hkSendInner);
-        DbgLog("hkRecvInner at: 0x%08X\n", (DWORD)&hkRecvInner);
-
-        // Test: call trampoline BEFORE patching (should call original function normally)
-        DbgLog("\nPre-patch trampoline test...\n");
-        __try {
-            // send trampoline: MOV EDI,EDI + JMP to sendFunc+2
-            // This should execute the original send function (which currently has 8B FF at start)
-            // But we can't actually call send without a socket, so just verify the trampoline is executable
-            uint8_t firstByte = sendTrampoline[0];
-            uint8_t secondByte = sendTrampoline[1];
-            DbgLog("send trampoline readable: %02X %02X (should be 8B FF)\n", firstByte, secondByte);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            DbgLog("WARNING: trampoline memory not readable!\n");
+        // Select hook functions based on mode
+        DWORD hookSendAddr, hookRecvAddr;
+        switch (mode) {
+        case 0:
+            hookSendAddr = (DWORD)&hkSendNaked;
+            hookRecvAddr = (DWORD)&hkRecvNaked;
+            DbgLog("Using NAKED hooks (zero overhead JMP)\n");
+            break;
+        case 1:
+            hookSendAddr = (DWORD)&hkSendMinimal;
+            hookRecvAddr = (DWORD)&hkRecvMinimal;
+            DbgLog("Using MINIMAL hooks (stdcall passthrough)\n");
+            break;
+        default:
+            hookSendAddr = (DWORD)&hkSendFull;
+            hookRecvAddr = (DWORD)&hkRecvFull;
+            DbgLog("Using FULL hooks (logging + SEH)\n");
+            break;
         }
 
-        // Apply hot-patches
+        DbgLog("hookSend at: 0x%08X\n", hookSendAddr);
+        DbgLog("hookRecv at: 0x%08X\n", hookRecvAddr);
+
+        // Dump first bytes of hook function to verify it's real code
+        HexDump(hookSendAddr, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("hookSend bytes: %s\n", hexBuf);
+        HexDump(hookRecvAddr, 16, hexBuf, sizeof(hexBuf));
+        DbgLog("hookRecv bytes: %s\n", hexBuf);
+
+        // Pre-hook log to file
+        RawLog("=== v6 Hook Runtime Log ===\n");
+        RawLogHex("Mode: ", (DWORD)mode);
+        RawLogHex("g_origSend: ", (DWORD)g_origSend);
+        RawLogHex("g_origRecv: ", (DWORD)g_origRecv);
+        RawLog("Hooks about to be activated...\n");
+
         DbgLog("\nApplying hot-patches...\n");
 
         bool sendOk = ApplyHotPatch(sendFuncAddr, hookSendAddr, sendOrigPad, sendOrigHead, "send");
         bool recvOk = ApplyHotPatch(recvFuncAddr, hookRecvAddr, recvOrigPad, recvOrigHead, "recv");
 
-        // Final verification: re-read oSend/oRecv to confirm they weren't clobbered
-        DbgLog("\nPost-patch verification:\n");
-        DbgLog("oSend = 0x%08X (should be 0x%08X)\n", (DWORD)oSend, (DWORD)sendTrampoline);
-        DbgLog("oRecv = 0x%08X (should be 0x%08X)\n", (DWORD)oRecv, (DWORD)recvTrampoline);
-
-        // Verify patched function bytes
+        // Post-patch verification
         HexDump(sendFuncAddr, 8, hexBuf, sizeof(hexBuf));
-        DbgLog("send func now: %s (should start with EB F9)\n", hexBuf);
+        DbgLog("send now: %s\n", hexBuf);
         HexDump(recvFuncAddr, 8, hexBuf, sizeof(hexBuf));
-        DbgLog("recv func now: %s (should start with EB F9)\n", hexBuf);
-
-        // Verify bytes at funcAddr+2 (where trampoline jumps to)
-        HexDump(sendFuncAddr + 2, 8, hexBuf, sizeof(hexBuf));
-        DbgLog("send at +2: %s (should be 55 8B EC = PUSH EBP; MOV EBP,ESP)\n", hexBuf);
-        HexDump(recvFuncAddr + 2, 8, hexBuf, sizeof(hexBuf));
-        DbgLog("recv at +2: %s (should be 55 8B EC = PUSH EBP; MOV EBP,ESP)\n", hexBuf);
+        DbgLog("recv now: %s\n", hexBuf);
 
         DbgLog("\nResult: send=%s recv=%s\n", sendOk ? "OK" : "FAIL", recvOk ? "OK" : "FAIL");
-        DbgLog("=== Hook Install Complete ===\n");
-        DbgLog("=== Check BlessedBot_hook.log for runtime hook diagnostics ===\n");
+        DbgLog("=== Hook Install Complete (Mode %d) ===\n", mode);
 
         return sendOk && recvOk;
     }
@@ -495,17 +463,19 @@ namespace Hooks {
             RestoreHotPatch(recvFuncAddr, recvOrigPad, recvOrigHead);
         if (sendTrampoline) { VirtualFree(sendTrampoline, 0, MEM_RELEASE); sendTrampoline = nullptr; }
         if (recvTrampoline) { VirtualFree(recvTrampoline, 0, MEM_RELEASE); recvTrampoline = nullptr; }
+        g_origSend = nullptr;
+        g_origRecv = nullptr;
         oSend = nullptr;
         oRecv = nullptr;
         if (logFile) { fclose(logFile); logFile = nullptr; }
         if (hHookLog != INVALID_HANDLE_VALUE) { CloseHandle(hHookLog); hHookLog = INVALID_HANDLE_VALUE; }
     }
 
-    // ---- Get hook stats for UI ----
+    // ---- Get hook stats ----
     inline void GetHookStats(char* buf, int bufSize) {
         sprintf_s(buf, bufSize,
-            "Send hooks: %ld (crashes: %ld) | Recv hooks: %ld (crashes: %ld)",
-            sendHookCount, sendCrashCount, recvHookCount, recvCrashCount);
+            "Mode %ld | Send: %ld (crash: %ld) | Recv: %ld (crash: %ld)",
+            hookMode, sendHookCount, sendCrashCount, recvHookCount, recvCrashCount);
     }
 
     // ---- IAT Hook Helper (for DefenderBypass) ----

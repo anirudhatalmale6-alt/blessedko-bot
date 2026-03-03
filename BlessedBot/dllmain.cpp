@@ -14,12 +14,36 @@
 // ============================================================
 // BlessedKO Bot - DLL Entry Point
 // Phase 1: Scanner, Hook, and Bypass validation tool
+// v6: Progressive diagnostic hook modes
 // ============================================================
 
 static HMODULE g_hModule = nullptr;
 static bool g_running = false;
 static bool g_hooksInstalled = false;
 static bool g_defenderBypassed = false;
+static int g_hookMode = 0;  // 0=naked, 1=minimal, 2=full
+
+// ---- Helper: show debug info in UI ----
+static void ShowDebugInfo(const char* prefix) {
+    char* line = Hooks::debugInfo;
+    while (*line) {
+        char* nl = strchr(line, '\n');
+        if (nl) {
+            *nl = 0;
+            char logLine[512];
+            sprintf_s(logLine, "%s %s", prefix, line);
+            BotUI::Log(logLine);
+            *nl = '\n';
+            line = nl + 1;
+        }
+        else {
+            char logLine[512];
+            sprintf_s(logLine, "%s %s", prefix, line);
+            BotUI::Log(logLine);
+            break;
+        }
+    }
+}
 
 // ---- Button callbacks ----
 
@@ -46,61 +70,33 @@ void OnHookClick() {
         return;
     }
 
-    BotUI::Log("[*] Installing network hooks v5 (hot-patch + SEH)...");
-    BotUI::Log("[*] With crash protection and runtime diagnostics...");
+    const char* modeNames[] = { "NAKED passthrough", "MINIMAL passthrough", "FULL (logging+SEH)" };
+    char msg[256];
+    sprintf_s(msg, "[*] Installing hooks v6 - Mode %d: %s", g_hookMode, modeNames[g_hookMode]);
+    BotUI::Log(msg);
 
-    if (Hooks::InstallNetworkHooks()) {
+    if (g_hookMode == 0) {
+        BotUI::Log("[*] NAKED mode: zero code execution, pure JMP forwarding");
+        BotUI::Log("[*] If this crashes, the trampoline mechanism is broken");
+        BotUI::Log("[*] If this WORKS, the game will run normally (invisible hook)");
+    }
+
+    if (Hooks::InstallNetworkHooks(g_hookMode)) {
         g_hooksInstalled = true;
+        ShowDebugInfo("[*]");
 
-        // Show detailed debug info from the hook engine
-        // Split debugInfo by newlines and log each line
-        char* line = Hooks::debugInfo;
-        while (*line) {
-            char* nl = strchr(line, '\n');
-            if (nl) {
-                *nl = 0;
-                char logLine[512];
-                sprintf_s(logLine, "[*] %s", line);
-                BotUI::Log(logLine);
-                *nl = '\n';
-                line = nl + 1;
-            }
-            else {
-                char logLine[512];
-                sprintf_s(logLine, "[*] %s", line);
-                BotUI::Log(logLine);
-                break;
-            }
-        }
+        sprintf_s(msg, "[+] Hooks active! Mode %d: %s", g_hookMode, modeNames[g_hookMode]);
+        BotUI::Log(msg);
+        BotUI::Log("[+] If game is still running - HOOKS WORK!");
+        BotUI::Log("[+] Check BlessedBot_debug.log + BlessedBot_hook.log");
 
-        BotUI::Log("[+] Network hooks installed successfully!");
-        BotUI::Log("[+] IAT entries untouched - KODefender safe");
-        BotUI::Log("[+] SEH crash protection active");
-        BotUI::Log("[+] Debug: BlessedBot_debug.log + BlessedBot_hook.log");
-        BotUI::SetStatus("Status: Hooks active (v5 hot-patch+SEH)");
+        sprintf_s(msg, "Status: Hooks active (v6 mode %d)", g_hookMode);
+        BotUI::SetStatus(msg);
     }
     else {
-        BotUI::Log("[-] Failed to install inline hooks!");
-        // Still show debug info for diagnostics
-        char* line = Hooks::debugInfo;
-        while (*line) {
-            char* nl = strchr(line, '\n');
-            if (nl) {
-                *nl = 0;
-                char logLine[512];
-                sprintf_s(logLine, "[-] %s", line);
-                BotUI::Log(logLine);
-                *nl = '\n';
-                line = nl + 1;
-            }
-            else {
-                char logLine[512];
-                sprintf_s(logLine, "[-] %s", line);
-                BotUI::Log(logLine);
-                break;
-            }
-        }
-        BotUI::Log("    Send the screenshot of these logs to me for debugging!");
+        BotUI::Log("[-] Failed to install hooks!");
+        ShowDebugInfo("[-]");
+        BotUI::Log("    Send screenshots of logs to me for debugging!");
     }
 }
 
@@ -143,12 +139,19 @@ void OnDumpClick() {
         return;
     }
 
-    // Show hook stats first
+    // Show hook stats
     char statsBuf[256];
     Hooks::GetHookStats(statsBuf, sizeof(statsBuf));
     char statsLine[300];
     sprintf_s(statsLine, "[*] Hook stats: %s", statsBuf);
     BotUI::Log(statsLine);
+
+    // Only show packet log in mode 2
+    if (g_hookMode < 2) {
+        BotUI::Log("[*] Packet capture only available in Mode 2 (FULL)");
+        BotUI::Log("[*] Current mode is passthrough - no packets captured");
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(Hooks::logMutex);
 
@@ -156,14 +159,12 @@ void OnDumpClick() {
     sprintf_s(buf, "[*] Packet log: %zu packets captured", Hooks::packetLog.size());
     BotUI::Log(buf);
 
-    // Show last 20 packets
     size_t start = Hooks::packetLog.size() > 20 ? Hooks::packetLog.size() - 20 : 0;
     for (size_t i = start; i < Hooks::packetLog.size(); i++) {
         auto& pkt = Hooks::packetLog[i];
         std::string hex;
         char hexBuf[4];
 
-        // Show first 32 bytes max
         size_t showLen = pkt.data.size() > 32 ? 32 : pkt.data.size();
         for (size_t j = 0; j < showLen; j++) {
             sprintf_s(hexBuf, "%02X ", pkt.data[j]);
@@ -177,9 +178,8 @@ void OnDumpClick() {
             hex.c_str());
         BotUI::Log(buf);
 
-        // Try to identify the opcode
         if (pkt.data.size() >= 3) {
-            uint8_t opcode = pkt.data[2]; // After 2-byte length header
+            uint8_t opcode = pkt.data[2];
             const char* opName = "UNKNOWN";
             switch (opcode) {
             case KO::Opcode::WIZ_MOVE:          opName = "WIZ_MOVE"; break;
@@ -213,12 +213,10 @@ void OnTestReadClick() {
 
     char buf[512];
 
-    // Test reading the PE header (should always work)
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hGame;
     sprintf_s(buf, "[+] DOS magic: 0x%04X (should be 0x5A4D)", dos->e_magic);
     BotUI::Log(buf);
 
-    // Test reading known strings
     DWORD testStr = Scanner::FindString(hGame, "KnightOnline");
     if (testStr) {
         std::string s = MemScanner::ReadString(testStr, 32);
@@ -226,21 +224,17 @@ void OnTestReadClick() {
         BotUI::Log(buf);
     }
 
-    // Try to find player name from Option.ini LoginUID
-    // The game stores the login ID in memory after reading Option.ini
     DWORD loginStr = Scanner::FindString(hGame, "LoginUID");
     if (loginStr) {
         sprintf_s(buf, "[+] LoginUID reference at: 0x%08X", loginStr);
         BotUI::Log(buf);
     }
 
-    // Check if wsock32 is loaded
     HMODULE hWsock = GetModuleHandleA("wsock32.dll");
     if (hWsock) {
         sprintf_s(buf, "[+] wsock32.dll at: 0x%08X", (DWORD)hWsock);
         BotUI::Log(buf);
 
-        // Read IAT to verify send/recv addresses
         DWORD sendAddr = MemScanner::ReadMem<DWORD>(KO::IAT::WS_SEND);
         DWORD recvAddr = MemScanner::ReadMem<DWORD>(KO::IAT::WS_RECV);
         sprintf_s(buf, "[+] IAT send() -> 0x%08X", sendAddr);
@@ -254,29 +248,28 @@ void OnTestReadClick() {
 
 // ---- Main bot thread ----
 void BotThread() {
-    // Wait a moment for the game to fully initialize
     Sleep(2000);
 
-    // Create the UI
     BotUI::Create((HINSTANCE)g_hModule);
 
-    // Set up callbacks
     BotUI::onScanClick = OnScanClick;
     BotUI::onHookClick = OnHookClick;
     BotUI::onBypassClick = OnBypassClick;
     BotUI::onDumpClick = OnDumpClick;
     BotUI::onTestReadClick = OnTestReadClick;
 
-    BotUI::Log("=== BlessedKO Bot v1.0 - Phase 1 ===");
-    BotUI::Log("Scanner & Hook Validation Tool");
-    BotUI::Log("================================");
+    BotUI::Log("=== BlessedKO Bot v6 - Diagnostic Build ===");
+    BotUI::Log("Progressive Hook Testing");
+    BotUI::Log("=========================================");
+    BotUI::Log("");
+    BotUI::Log("Hook Mode 0: NAKED (pure JMP, zero code)");
+    BotUI::Log("  Tests if hot-patch + trampoline work at all");
     BotUI::Log("");
     BotUI::Log("Instructions:");
     BotUI::Log("1. Click 'Bypass Defender' first");
-    BotUI::Log("2. Click 'Hook Net' to intercept packets");
-    BotUI::Log("3. Click 'Scan Memory' to find game structures");
-    BotUI::Log("4. Click 'Test Read' to verify memory access");
-    BotUI::Log("5. Play the game normally, then 'Dump Packets'");
+    BotUI::Log("2. Click 'Hook Net' (starts in Mode 0)");
+    BotUI::Log("3. If game survives 10+ seconds = SUCCESS");
+    BotUI::Log("4. Send me both .log files");
     BotUI::Log("");
     BotUI::Log("[+] Bot DLL loaded successfully!");
 
@@ -286,7 +279,6 @@ void BotThread() {
 
     BotUI::SetStatus("Status: Ready - bypass defender first!");
 
-    // Run the message loop
     BotUI::MessageLoop();
 }
 
@@ -297,7 +289,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
 
-        // Launch bot in a separate thread
         g_running = true;
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
             BotThread();
