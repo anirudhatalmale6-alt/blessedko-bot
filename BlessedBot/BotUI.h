@@ -23,6 +23,12 @@ namespace BotUI {
         ID_BTN_DUMP_PACKETS,
         ID_BTN_CLEAR_LOG,
         ID_BTN_TEST_READ,
+        ID_BTN_START_BOT,
+        ID_BTN_STOP_BOT,
+        ID_BTN_AUTO_ATK,
+        ID_BTN_AUTO_LOOT,
+        ID_BTN_SHOW_STATE,
+        ID_BTN_SHOW_OPCODES,
         ID_LABEL_HP,
         ID_LABEL_MP,
         ID_LABEL_POS,
@@ -48,6 +54,12 @@ namespace BotUI {
     inline std::function<void()> onBypassClick;
     inline std::function<void()> onDumpClick;
     inline std::function<void()> onTestReadClick;
+    inline std::function<void()> onStartBotClick;
+    inline std::function<void()> onStopBotClick;
+    inline std::function<void()> onAutoAtkClick;
+    inline std::function<void()> onAutoLootClick;
+    inline std::function<void()> onShowStateClick;
+    inline std::function<void()> onShowOpcodesClick;
 
     // Append text to log
     inline void Log(const char* text) {
@@ -99,6 +111,24 @@ namespace BotUI {
             case ID_BTN_TEST_READ:
                 if (onTestReadClick) onTestReadClick();
                 break;
+            case ID_BTN_START_BOT:
+                if (onStartBotClick) onStartBotClick();
+                break;
+            case ID_BTN_STOP_BOT:
+                if (onStopBotClick) onStopBotClick();
+                break;
+            case ID_BTN_AUTO_ATK:
+                if (onAutoAtkClick) onAutoAtkClick();
+                break;
+            case ID_BTN_AUTO_LOOT:
+                if (onAutoLootClick) onAutoLootClick();
+                break;
+            case ID_BTN_SHOW_STATE:
+                if (onShowStateClick) onShowStateClick();
+                break;
+            case ID_BTN_SHOW_OPCODES:
+                if (onShowOpcodesClick) onShowOpcodesClick();
+                break;
             }
             break;
 
@@ -141,9 +171,9 @@ namespace BotUI {
         hMainWnd = CreateWindowExA(
             WS_EX_TOPMOST,
             "BlessedBotWnd",
-            "BlessedKO Bot v1.0 - Phase 1 Scanner",
+            "BlessedKO Bot v2.0 - Phase 2",
             WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
-            100, 100, 620, 580,
+            100, 100, 620, 640,
             nullptr, nullptr, hInst, nullptr
         );
 
@@ -175,19 +205,32 @@ namespace BotUI {
         CreateLabel(hMainWnd, 300, 115, 40, 15, "Zone:");
         hZoneLabel = CreateLabel(hMainWnd, 340, 115, 100, 15, "N/A", ID_LABEL_ZONE);
 
-        // ---- Buttons ----
+        // ---- Row 1: Phase 1 buttons ----
         int btnY = 145;
-        CreateBtn(hMainWnd, 10, btnY, 120, 30, "Scan Memory", ID_BTN_SCAN);
-        CreateBtn(hMainWnd, 140, btnY, 120, 30, "Hook Net", ID_BTN_HOOK);
-        CreateBtn(hMainWnd, 270, btnY, 120, 30, "Bypass Defender", ID_BTN_BYPASS);
-        CreateBtn(hMainWnd, 10, btnY + 35, 120, 30, "Dump Packets", ID_BTN_DUMP_PACKETS);
-        CreateBtn(hMainWnd, 140, btnY + 35, 120, 30, "Test Read", ID_BTN_TEST_READ);
-        CreateBtn(hMainWnd, 270, btnY + 35, 120, 30, "Clear Log", ID_BTN_CLEAR_LOG);
+        CreateBtn(hMainWnd, 10, btnY, 120, 28, "Scan Memory", ID_BTN_SCAN);
+        CreateBtn(hMainWnd, 140, btnY, 120, 28, "Hook Net", ID_BTN_HOOK);
+        CreateBtn(hMainWnd, 270, btnY, 120, 28, "Bypass Defender", ID_BTN_BYPASS);
+
+        // ---- Row 2: Phase 1 tools ----
+        CreateBtn(hMainWnd, 10, btnY + 32, 120, 28, "Dump Packets", ID_BTN_DUMP_PACKETS);
+        CreateBtn(hMainWnd, 140, btnY + 32, 120, 28, "Test Read", ID_BTN_TEST_READ);
+        CreateBtn(hMainWnd, 270, btnY + 32, 120, 28, "Clear Log", ID_BTN_CLEAR_LOG);
+
+        // ---- Row 3: Phase 2 bot controls ----
+        CreateLabel(hMainWnd, 10, btnY + 68, 580, 1, ""); // separator
+        CreateBtn(hMainWnd, 10, btnY + 72, 90, 28, "Start Bot", ID_BTN_START_BOT);
+        CreateBtn(hMainWnd, 105, btnY + 72, 90, 28, "Stop Bot", ID_BTN_STOP_BOT);
+        CreateBtn(hMainWnd, 200, btnY + 72, 90, 28, "Auto Atk", ID_BTN_AUTO_ATK);
+        CreateBtn(hMainWnd, 295, btnY + 72, 90, 28, "Auto Loot", ID_BTN_AUTO_LOOT);
+
+        // ---- Row 4: Phase 2 info ----
+        CreateBtn(hMainWnd, 10, btnY + 104, 90, 28, "Game State", ID_BTN_SHOW_STATE);
+        CreateBtn(hMainWnd, 105, btnY + 104, 90, 28, "Opcodes", ID_BTN_SHOW_OPCODES);
 
         // ---- Log area ----
         hLogEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            10, btnY + 75, 580, 300,
+            10, btnY + 140, 580, 250,
             hMainWnd, (HMENU)ID_LOG_TEXT, nullptr, nullptr);
 
         // Set monospace font for log

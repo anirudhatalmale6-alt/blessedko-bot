@@ -92,6 +92,9 @@
     <ClInclude Include="BotUI.h" />
     <ClInclude Include="DefenderBypass.h" />
     <ClInclude Include="Hooks.h" />
+    <ClInclude Include="PacketParser.h" />
+    <ClInclude Include="GameState.h" />
+    <ClInclude Include="BotEngine.h" />
     <ClInclude Include="MemoryScanner.h" />
     <ClInclude Include="..\Common\KOStructs.h" />
     <ClInclude Include="..\Common\PacketBuilder.h" />
