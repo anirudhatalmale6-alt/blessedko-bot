@@ -121,13 +121,15 @@ namespace PacketParser {
         }
     }
 
-    // Opcode name lookup
+    // Opcode name lookup (expanded for BlessedKO v23xx)
     inline const char* OpcodeName(uint8_t op) {
         switch (op) {
+        // Standard USKO opcodes
         case KO::Opcode::WIZ_MYINFO:          return "MYINFO";
         case KO::Opcode::WIZ_MOVE:            return "MOVE";
         case KO::Opcode::WIZ_ROTATE:          return "ROTATE";
         case KO::Opcode::WIZ_ATTACK:          return "ATTACK";
+        case KO::Opcode::WIZ_NPC_INOUT:       return "NPC_INOUT";
         case KO::Opcode::WIZ_HP_CHANGE:       return "HP_CHG";
         case KO::Opcode::WIZ_MSP_CHANGE:      return "MP_CHG";
         case KO::Opcode::WIZ_EXP_CHANGE:      return "EXP_CHG";
@@ -147,8 +149,36 @@ namespace PacketParser {
         case KO::Opcode::WIZ_BUFF:            return "BUFF";
         case KO::Opcode::WIZ_SELECT_TARGET:   return "SEL_TGT";
         case KO::Opcode::WIZ_RESURRECT:       return "RESURRECT";
+        case KO::Opcode::WIZ_HEARTBEAT:       return "HEARTBEAT";
+        // BlessedKO observed (unknown mapping - need isolation tests)
+        case 0x09: return "UNK_09";
+        case 0x0A: return "UNK_0A";
+        case 0x10: return "UNK_10";
+        case 0x18: return "UNK_18";
+        case 0x1C: return "UNK_1C";
+        case 0x1D: return "UNK_1D";
+        case 0x1F: return "UNK_1F";
+        case 0x29: return "UNK_29";
+        case 0x2E: return "UNK_2E";
+        case 0x33: return "UNK_33";
+        case 0x3D: return "UNK_3D";
+        case 0x41: return "UNK_41";
+        case 0x54: return "UNK_54";
+        case 0x5B: return "UNK_5B";
+        case 0x64: return "UNK_64";
+        case 0x68: return "UNK_68";
+        case 0x69: return "UNK_69";
+        case 0x83: return "UNK_83";
+        case 0x87: return "UNK_87";
+        case 0x98: return "UNK_98";
         default: return nullptr;
         }
+    }
+
+    // Reset stats (for isolation testing)
+    inline void ResetStats() {
+        parsedSendCount = 0;
+        parsedRecvCount = 0;
     }
 
     // Build opcode frequency table string

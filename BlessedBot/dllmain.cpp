@@ -270,7 +270,8 @@ void OnShowStateClick() {
     BotUI::SetTarget(label);
     sprintf_s(label, "%d", GameState::player.zone);
     BotUI::SetZone(label);
-    sprintf_s(label, "PID: %d", GameState::player.id);
+    sprintf_s(label, "PID: %d%s", GameState::player.id,
+        GameState::player.id == 0 ? " (walk to detect)" : "");
     BotUI::SetName(label);
 }
 
@@ -311,6 +312,14 @@ void OnShowOpcodesClick() {
     }
 }
 
+void OnResetClick() {
+    GameState::ResetOpcodes();
+    PacketParser::ResetStats();
+    BotUI::Log("[*] Opcode counters RESET");
+    BotUI::Log("[*] Now do ONE action, then click Opcodes");
+    BotUI::SetStatus("Status: Counters reset - isolate!");
+}
+
 // ---- Main bot thread ----
 void BotThread() {
     // Hide our DLL immediately
@@ -332,19 +341,21 @@ void BotThread() {
     BotUI::onAutoLootClick = OnAutoLootClick;
     BotUI::onShowStateClick = OnShowStateClick;
     BotUI::onShowOpcodesClick = OnShowOpcodesClick;
+    BotUI::onResetClick = OnResetClick;
 
-    BotUI::Log("=== BlessedKO Bot v2.0 - Phase 2 ===");
-    BotUI::Log("Packet parsing + Game state + Auto-attack");
-    BotUI::Log("=======================================");
+    BotUI::Log("=== BlessedKO Bot v2.1 - Isolation Ready ===");
+    BotUI::Log("Player pos + ID detect + Opcode isolation");
+    BotUI::Log("==========================================");
     BotUI::Log("");
     BotUI::Log("Setup:");
     BotUI::Log("  1. Bypass Defender (clears debug flags)");
     BotUI::Log("  2. Hook Net (installs hooks + parser)");
+    BotUI::Log("  3. Walk around -> pos tracked + ID detected");
     BotUI::Log("");
-    BotUI::Log("Bot controls:");
-    BotUI::Log("  Start Bot  - enables auto-attack + loot");
-    BotUI::Log("  Game State - shows HP/MP/pos/target");
-    BotUI::Log("  Opcodes    - shows packet frequency");
+    BotUI::Log("Isolation test (find unknown opcodes):");
+    BotUI::Log("  1. Click Reset (clears counters)");
+    BotUI::Log("  2. Do ONE action in-game");
+    BotUI::Log("  3. Click Opcodes -> new opcode = that action");
     BotUI::Log("");
     BotUI::Log("[+] DLL stealth active (PEB unlink + PE erase)");
 

@@ -11,8 +11,10 @@
 // ============================================================
 // Game State - Track all game state from parsed packets
 //
-// All data comes from intercepted packets (no memory reads).
-// This is 100% safe and undetectable.
+// v2.1: Parse SENT MOVE for player position
+//       Auto-detect player ID from RECV MOVE correlation
+//       Parse 0x0B entity IN/OUT (spawn/despawn)
+//       Hex-log unknown opcodes for analysis
 // ============================================================
 
 namespace GameState {
@@ -74,6 +76,21 @@ namespace GameState {
         }
     }
 
+    // Hex-dump a packet to log file (for analyzing unknown opcodes)
+    inline void LogPacketHex(const char* tag, uint8_t opcode, bool isSend,
+        const uint8_t* data, size_t len) {
+        if (!logFile) fopen_s(&logFile, "BlessedBot_state.log", "a");
+        if (!logFile) return;
+        fprintf(logFile, "[HEX] %s %s 0x%02X (%zu): ",
+            tag, isSend ? "S" : "R", opcode, len);
+        size_t show = len > 48 ? 48 : len;
+        for (size_t i = 0; i < show; i++)
+            fprintf(logFile, "%02X ", data[i]);
+        if (len > 48) fprintf(logFile, "...");
+        fprintf(logFile, "\n");
+        fflush(logFile);
+    }
+
     // ---- Helpers ----
     inline float Distance2D(float x1, float z1, float x2, float z2) {
         float dx = x2 - x1, dz = z2 - z1;
@@ -130,8 +147,20 @@ namespace GameState {
         return best;
     }
 
+    // Reset opcode counters (for isolation testing)
+    inline void ResetOpcodes() {
+        memset((void*)sendOpcodes, 0, sizeof(sendOpcodes));
+        memset((void*)recvOpcodes, 0, sizeof(recvOpcodes));
+    }
+
     // ================================================================
     // Packet Handler - decode each packet and update state
+    //
+    // v2.1 changes:
+    //   - Parse SENT MOVE (0x06) for player position
+    //   - Auto-detect player ID from RECV MOVE position match
+    //   - Parse 0x0B entity IN/OUT (spawn/despawn)
+    //   - Hex-log samples of unknown opcodes to state.log
     // ================================================================
     inline void OnPacket(const PacketParser::ParsedPacket& pkt) {
         // Count opcodes
@@ -143,21 +172,43 @@ namespace GameState {
         const uint8_t* d = pkt.payload;
         size_t len = pkt.payloadLen;
 
+        // Hex-log first 3 samples of each non-trivial opcode
+        static int hexSamples[256] = {};
+        if (pkt.opcode != KO::Opcode::WIZ_MOVE &&
+            pkt.opcode != KO::Opcode::WIZ_ROTATE &&
+            pkt.opcode != KO::Opcode::WIZ_HEARTBEAT) {
+            if (hexSamples[pkt.opcode] < 3) {
+                LogPacketHex("SAMPLE", pkt.opcode, pkt.isSend, d, len);
+                hexSamples[pkt.opcode]++;
+            }
+        }
+
         // ---- Process SENT packets ----
         if (pkt.isSend) {
+            std::lock_guard<std::mutex> lock(mtx);
+
             switch (pkt.opcode) {
 
+            case KO::Opcode::WIZ_MOVE:
+                // SENT MOVE has no player ID (server knows sender)
+                // Format: [x:u16/10] [y:u16/10] [z:u16/10] [...]
+                if (len >= 6) {
+                    player.x = (float)(uint16_t)(d[0] | (d[1] << 8)) / 10.0f;
+                    player.y = (float)(uint16_t)(d[2] | (d[3] << 8)) / 10.0f;
+                    player.z = (float)(uint16_t)(d[4] | (d[5] << 8)) / 10.0f;
+                }
+                break;
+
             case KO::Opcode::WIZ_SELECT_TARGET:
-                // SEND: [targetId:2]
+                // Standard 0x3A - may be different opcode on this server
                 if (len >= 2) {
-                    std::lock_guard<std::mutex> lock(mtx);
                     targetId = d[0] | (d[1] << 8);
                     targetHpPct = 100;
                     targetDead = false;
                 }
                 break;
             }
-            return; // Don't process sent packets further
+            return;
         }
 
         // ---- Process RECEIVED packets ----
@@ -166,31 +217,27 @@ namespace GameState {
         switch (pkt.opcode) {
 
         case KO::Opcode::WIZ_MYINFO:
-            // First packet after login - contains player info
-            // Format varies by server, but typically:
-            // [id:2] [name:str] [nation:1] [race:1] [class:2] [level:1]
-            // [hp:2] [maxHp:2] [mp:2] [maxMp:2] [x:2] [y:2] [z:2] ...
+            // Login info - usually missed (sent before hooks installed)
             if (len >= 2) {
                 player.id = d[0] | (d[1] << 8);
-                Log("Player ID: %d\n", player.id);
+                Log("Player ID from MYINFO: %d\n", player.id);
             }
             break;
 
         case KO::Opcode::WIZ_HP_CHANGE:
-            // [id:2] [hp:4] or [currentHp:2] [maxHp:2] [attacker:2]
-            // Standard USKO: [id:2] [currentHp:int32]
+            // Standard USKO 0x13 - likely different opcode on this server
             if (len >= 6) {
                 uint16_t id = d[0] | (d[1] << 8);
                 int32_t hp = d[2] | (d[3] << 8) | (d[4] << 16) | (d[5] << 24);
                 if (id == player.id || player.id == 0) {
                     player.hp = hp;
-                    // Try to capture maxHp from first positive value
                     if (hp > player.maxHp) player.maxHp = hp;
                 }
             }
             break;
 
         case KO::Opcode::WIZ_MSP_CHANGE:
+            // Standard USKO 0x14 - likely different opcode on this server
             if (len >= 6) {
                 uint16_t id = d[0] | (d[1] << 8);
                 int32_t mp = d[2] | (d[3] << 8) | (d[4] << 16) | (d[5] << 24);
@@ -202,12 +249,22 @@ namespace GameState {
             break;
 
         case KO::Opcode::WIZ_MOVE:
-            // [id:2] [x:u16] [y:u16] [z:u16] [speed:u16] ...
+            // RECV: [id:2] [x:u16/10] [y:u16/10] [z:u16/10] ...
             if (len >= 8) {
                 uint16_t id = d[0] | (d[1] << 8);
                 float mx = (float)(uint16_t)(d[2] | (d[3] << 8)) / 10.0f;
                 float my = (float)(uint16_t)(d[4] | (d[5] << 8)) / 10.0f;
                 float mz = (float)(uint16_t)(d[6] | (d[7] << 8)) / 10.0f;
+
+                // Auto-detect player ID: match RECV entity with our SENT position
+                if (player.id == 0 && player.x != 0.0f) {
+                    float dx = fabsf(mx - player.x);
+                    float dz = fabsf(mz - player.z);
+                    if (dx < 2.0f && dz < 2.0f) {
+                        player.id = id;
+                        Log("Auto-detected player ID: %d (dx=%.1f dz=%.1f)\n", id, dx, dz);
+                    }
+                }
 
                 if (id == player.id) {
                     player.x = mx; player.y = my; player.z = mz;
@@ -218,8 +275,48 @@ namespace GameState {
             }
             break;
 
+        case KO::Opcode::WIZ_NPC_INOUT:
+            // Entity spawn/despawn (0x0B) - 2699 recv in Moradon
+            // Try common USKO format: [subop:1] [id:2] [if IN: npcId + pos...]
+            if (len >= 3) {
+                uint8_t subop = d[0];
+                uint16_t eid = d[1] | (d[2] << 8);
+
+                if ((subop == 0x01 || subop == 0x03) && len >= 9) {
+                    // IN variants: [sub:1][id:2][npcId:2][x:u16][z:u16]
+                    uint16_t npcId = d[3] | (d[4] << 8);
+                    float ex = (float)(uint16_t)(d[5] | (d[6] << 8)) / 10.0f;
+                    float ez = (float)(uint16_t)(d[7] | (d[8] << 8)) / 10.0f;
+                    float ey = (len >= 11) ?
+                        (float)(uint16_t)(d[9] | (d[10] << 8)) / 10.0f : 0.0f;
+
+                    // Sanity: only add if position looks valid
+                    if (ex > 1.0f || ez > 1.0f) {
+                        Entity* e = FindEntity(eid);
+                        if (e) {
+                            e->npcId = npcId; e->x = ex; e->y = ey; e->z = ez;
+                            e->isDead = false; e->lastSeen = GetTickCount();
+                        }
+                        else if (entities.size() < 500) {
+                            Entity ne = {};
+                            ne.id = eid; ne.npcId = npcId;
+                            ne.x = ex; ne.y = ey; ne.z = ez;
+                            ne.hpPct = 100; ne.isDead = false;
+                            ne.lastSeen = GetTickCount();
+                            entities.push_back(ne);
+                        }
+                    }
+                }
+                else if (subop == 0x02 || subop == 0x04 || subop == 0x05) {
+                    // OUT variants: remove entity
+                    auto it = std::remove_if(entities.begin(), entities.end(),
+                        [eid](const Entity& e) { return e.id == eid; });
+                    entities.erase(it, entities.end());
+                }
+            }
+            break;
+
         case KO::Opcode::WIZ_TARGET_HP:
-            // [id:2] [hpPct:1] or [id:2] [currentHp:4] [maxHp:4]
             if (len >= 3) {
                 uint16_t id = d[0] | (d[1] << 8);
                 uint8_t hp = d[2];
@@ -277,7 +374,6 @@ namespace GameState {
         case KO::Opcode::WIZ_ZONE_CHANGE:
             if (len >= 1) {
                 player.zone = d[0];
-                // Clear entities on zone change
                 entities.clear();
                 lootDrops.clear();
                 Log("Zone changed to %d\n", player.zone);
@@ -290,11 +386,12 @@ namespace GameState {
     inline void GetStateString(char* buf, int bufSize) {
         std::lock_guard<std::mutex> lock(mtx);
         sprintf_s(buf, bufSize,
-            "ID: %d | HP: %d/%d | MP: %d/%d\n"
+            "ID: %d%s | HP: %d/%d | MP: %d/%d\n"
             "Pos: (%.1f, %.1f, %.1f) | Zone: %d\n"
             "Target: %d (HP: %d%%) %s\n"
             "Entities: %zu | Loot: %zu",
-            player.id, player.hp, player.maxHp, player.mp, player.maxMp,
+            player.id, player.id == 0 ? " (detecting)" : "",
+            player.hp, player.maxHp, player.mp, player.maxMp,
             player.x, player.y, player.z, player.zone,
             targetId, targetHpPct, targetDead ? "[DEAD]" : "",
             entities.size(), lootDrops.size());

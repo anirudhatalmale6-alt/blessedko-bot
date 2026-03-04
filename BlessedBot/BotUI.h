@@ -35,6 +35,7 @@ namespace BotUI {
         ID_LABEL_TARGET,
         ID_LABEL_ZONE,
         ID_LABEL_NAME,
+        ID_BTN_RESET_STATS,
     };
 
     // Window handles
@@ -60,6 +61,7 @@ namespace BotUI {
     inline std::function<void()> onAutoLootClick;
     inline std::function<void()> onShowStateClick;
     inline std::function<void()> onShowOpcodesClick;
+    inline std::function<void()> onResetClick;
 
     // Append text to log
     inline void Log(const char* text) {
@@ -129,6 +131,9 @@ namespace BotUI {
             case ID_BTN_SHOW_OPCODES:
                 if (onShowOpcodesClick) onShowOpcodesClick();
                 break;
+            case ID_BTN_RESET_STATS:
+                if (onResetClick) onResetClick();
+                break;
             }
             break;
 
@@ -171,7 +176,7 @@ namespace BotUI {
         hMainWnd = CreateWindowExA(
             WS_EX_TOPMOST,
             "BlessedBotWnd",
-            "BlessedKO Bot v2.0 - Phase 2",
+            "BlessedKO Bot v2.1 - Isolation Ready",
             WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
             100, 100, 620, 640,
             nullptr, nullptr, hInst, nullptr
@@ -226,6 +231,7 @@ namespace BotUI {
         // ---- Row 4: Phase 2 info ----
         CreateBtn(hMainWnd, 10, btnY + 104, 90, 28, "Game State", ID_BTN_SHOW_STATE);
         CreateBtn(hMainWnd, 105, btnY + 104, 90, 28, "Opcodes", ID_BTN_SHOW_OPCODES);
+        CreateBtn(hMainWnd, 200, btnY + 104, 90, 28, "Reset", ID_BTN_RESET_STATS);
 
         // ---- Log area ----
         hLogEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",

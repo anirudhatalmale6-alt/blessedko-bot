@@ -70,6 +70,10 @@ namespace KO {
 
         // Supply/Potion
         constexpr uint8_t WIZ_ITEM_USE          = 0x3C;
+
+        // BlessedKO v23xx confirmed opcodes
+        constexpr uint8_t WIZ_NPC_INOUT         = 0x0B;  // Entity spawn/despawn
+        constexpr uint8_t WIZ_HEARTBEAT          = 0xE9;  // Custom keepalive
     }
 
     // ---- Skill cast sub-opcodes ----
