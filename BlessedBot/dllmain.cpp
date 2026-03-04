@@ -107,9 +107,9 @@ void OnBypassClick() {
         return;
     }
 
-    BotUI::Log("[*] Bypassing KODefender (v2 zero-mod)...");
-    BotUI::Log("[*] Strategy: PEB stealth + VEH hardware breakpoints");
-    BotUI::Log("[*] KODefender code modified: ZERO bytes");
+    BotUI::Log("[*] Bypassing KODefender (v2.2)...");
+    BotUI::Log("[*] Strategy: PEB flags only (no heap, no VEH)");
+    BotUI::Log("[*] DLL already hidden at load time");
 
     HMODULE hDefender = GetModuleHandleA("KODefender.dll");
     if (!hDefender) {
@@ -119,13 +119,13 @@ void OnBypassClick() {
         return;
     }
 
-    BotUI::Log("[*] KODefender found, applying stealth...");
+    BotUI::Log("[*] KODefender found, clearing debug flags...");
 
     if (Defender::Install(g_hModule)) {
         g_defenderBypassed = true;
-        BotUI::Log("[+] Defender bypassed (zero-modification!)");
-        BotUI::Log("[+] PEB cleared + DLL hidden + PE erased + VEH active");
-        BotUI::SetStatus("Status: Stealth active (v2)");
+        BotUI::Log("[+] Anti-debug flags cleared");
+        BotUI::Log("[+] DLL hidden (PEB unlink) + PE erased (at load)");
+        BotUI::SetStatus("Status: Stealth active");
     }
     else {
         BotUI::Log("[-] Bypass failed!");
@@ -245,7 +245,7 @@ void BotThread() {
     BotUI::onDumpClick = OnDumpClick;
     BotUI::onTestReadClick = OnTestReadClick;
 
-    BotUI::Log("=== BlessedKO Bot v8.2 ===");
+    BotUI::Log("=== BlessedKO Bot v8.3 ===");
     BotUI::Log("Network: MOV reg,[IAT] indirect patching");
     BotUI::Log("Stealth: PEB unlink + PE erase (auto at load)");
     BotUI::Log("==========================================");

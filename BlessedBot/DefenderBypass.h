@@ -154,27 +154,22 @@ namespace Defender {
     inline void ClearPEBFlags() {
         DWORD peb = __readfsdword(0x30);
 
-        // BeingDebugged (PEB+0x02)
+        // BeingDebugged (PEB+0x02) - stable across all Windows versions
         BYTE* pDebug = (BYTE*)(peb + 0x02);
         BYTE oldDebug = *pDebug;
         *pDebug = 0;
         Log("PEB->BeingDebugged: %d -> 0\n", oldDebug);
 
-        // NtGlobalFlag (PEB+0x68)
+        // NtGlobalFlag (PEB+0x68) - stable across all Windows versions
         DWORD* pFlag = (DWORD*)(peb + 0x68);
         DWORD oldFlag = *pFlag;
         *pFlag = 0;
         Log("PEB->NtGlobalFlag: 0x%X -> 0\n", oldFlag);
 
-        // Heap flags (ProcessHeap+0x0C, +0x10)
-        DWORD heap = *(DWORD*)(peb + 0x18);
-        if (heap) {
-            DWORD oldHeapFlags = *(DWORD*)(heap + 0x0C);
-            DWORD oldForce = *(DWORD*)(heap + 0x10);
-            *(DWORD*)(heap + 0x0C) = 2; // HEAP_GROWABLE
-            *(DWORD*)(heap + 0x10) = 0;
-            Log("Heap flags: 0x%X -> 0x2, force: 0x%X -> 0\n", oldHeapFlags, oldForce);
-        }
+        // NOTE: Heap flags NOT modified. Offsets vary by Windows version
+        // (XP: +0x0C/+0x10, Win7+: different) and wrong offsets corrupt
+        // the heap causing abort() cascades. Since BeingDebugged is already
+        // 0 (we're injected, not debugged), heap flags are normal anyway.
     }
 
     // ================================================================
