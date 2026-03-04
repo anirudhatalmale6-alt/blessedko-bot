@@ -11,10 +11,11 @@
 // ============================================================
 // Game State - Track all game state from parsed packets
 //
-// v2.1: Parse SENT MOVE for player position
-//       Auto-detect player ID from RECV MOVE correlation
-//       Parse 0x0B entity IN/OUT (spawn/despawn)
-//       Hex-log unknown opcodes for analysis
+// v2.3: Fix 0x38 HP_CHANGE to 3-byte format [flag:1][hp:2]
+//       Fix 0x17 TARGET_HP to [id:2][hp:2][attacker:2]
+//       Add 0x18 stat handler [max_hp:2][max_mp:2]
+//       Track targetId from RECV 0x17 (not SEND 0x41)
+//       0x41 uses click coordinates, not entity IDs
 // ============================================================
 
 namespace GameState {
@@ -51,6 +52,8 @@ namespace GameState {
     // State
     inline Player player;
     inline uint16_t targetId = 0;
+    inline uint16_t targetHp = 0;       // Raw HP from 0x17
+    inline uint16_t targetMaxHp = 0;    // Max seen HP for current target
     inline uint8_t  targetHpPct = 0;
     inline bool     targetDead = false;
 
@@ -199,14 +202,8 @@ namespace GameState {
                 }
                 break;
 
-            case KO::Opcode::WIZ_SELECT_TARGET:
-                // Standard 0x3A - may be different opcode on this server
-                if (len >= 2) {
-                    targetId = d[0] | (d[1] << 8);
-                    targetHpPct = 100;
-                    targetDead = false;
-                }
-                break;
+            // NOTE: WIZ_SELECT_TARGET (0x41) SEND uses click coordinates [0][float:4][0],
+            // NOT entity IDs. Target tracking is done via RECV 0x17 instead.
             }
             return;
         }
@@ -225,30 +222,16 @@ namespace GameState {
             break;
 
         case KO::Opcode::WIZ_HP_CHANGE:
-            // BlessedKO 0x38 - HP change (isolated by client testing)
-            if (len >= 6) {
-                uint16_t id = d[0] | (d[1] << 8);
-                int32_t hp = d[2] | (d[3] << 8) | (d[4] << 16) | (d[5] << 24);
-                // Try reading maxHp if packet is large enough
-                int32_t maxHp = (len >= 10) ?
-                    (int32_t)(d[6] | (d[7] << 8) | (d[8] << 16) | (d[9] << 24)) : 0;
-                if (id == player.id || (player.id != 0 && false)) {
-                    player.hp = hp;
-                    if (maxHp > 0) player.maxHp = maxHp;
-                    else if (hp > player.maxHp) player.maxHp = hp;
-                    Log("HP: %d/%d (id=%d)\n", hp, player.maxHp, id);
-                }
-                // Also check if this is our ID (for auto-detection)
-                if (player.id == 0 && hp > 100) {
-                    // If we get an HP change for an entity with a reasonable HP,
-                    // it might be us. But we can't be sure without position matching.
-                    Log("HP_CHG for id=%d hp=%d (player not identified yet)\n", id, hp);
-                }
-                // Update entity HP if we know the entity
-                Entity* e = FindEntity(id);
-                if (e) {
-                    e->lastSeen = GetTickCount();
-                }
+            // BlessedKO 0x38 = 3-byte format: [flag:1] [hp:2 LE]
+            // No entity ID in packet — always refers to own player
+            // flag observed: 0x06 = damage taken
+            if (len >= 3) {
+                uint8_t flag = d[0];
+                uint16_t hp = d[1] | (d[2] << 8);
+                player.hp = (int32_t)hp;
+                if ((int32_t)hp > player.maxHp) player.maxHp = (int32_t)hp;
+                player.isDead = (hp == 0);
+                Log("HP: %d/%d (flag=0x%02X)\n", hp, player.maxHp, flag);
             }
             break;
 
@@ -334,19 +317,35 @@ namespace GameState {
             break;
 
         case KO::Opcode::WIZ_TARGET_HP:
-            if (len >= 3) {
+            // BlessedKO 0x17 = 6 bytes: [target_id:2] [hp:2] [attacker:2]
+            // Server sends this when target is selected or takes damage
+            if (len >= 6) {
                 uint16_t id = d[0] | (d[1] << 8);
-                uint8_t hp = d[2];
-                if (id == targetId) {
-                    targetHpPct = hp;
-                    targetDead = (hp == 0);
+                uint16_t hp = d[2] | (d[3] << 8);
+                uint16_t attacker = d[4] | (d[5] << 8);
+
+                // If target changed, reset max HP tracking
+                if (id != targetId) {
+                    targetMaxHp = hp;
                 }
+
+                targetId = id;
+                targetHp = hp;
+                if (hp > targetMaxHp) targetMaxHp = hp;
+                targetDead = (hp == 0);
+
+                // Compute percentage from observed max
+                targetHpPct = (targetMaxHp > 0) ?
+                    (uint8_t)((uint32_t)hp * 100 / targetMaxHp) : 100;
+
                 Entity* e = FindEntity(id);
                 if (e) {
-                    e->hpPct = hp;
                     e->isDead = (hp == 0);
                     e->lastSeen = GetTickCount();
                 }
+
+                Log("Target %d HP: %d/%d (%d%%) attacker: %d\n",
+                    id, hp, targetMaxHp, targetHpPct, attacker);
             }
             break;
 
@@ -396,6 +395,19 @@ namespace GameState {
                 Log("Zone changed to %d\n", player.zone);
             }
             break;
+
+        case 0x18:
+            // BlessedKO stat update: [max_hp:2] [max_mp:2]
+            // Observed: F5 13 CD 13 → hp=5109 mp=5069 (base stats pre-buff)
+            if (len >= 4) {
+                uint16_t mhp = d[0] | (d[1] << 8);
+                uint16_t mmp = d[2] | (d[3] << 8);
+                // Base max stats (buffs can push actual HP higher)
+                if (mhp > 0 && player.maxHp == 0) player.maxHp = mhp;
+                if (mmp > 0) player.maxMp = mmp;
+                Log("Stats 0x18: maxHP=%d maxMP=%d\n", mhp, mmp);
+            }
+            break;
         }
     }
 
@@ -405,12 +417,13 @@ namespace GameState {
         sprintf_s(buf, bufSize,
             "ID: %d%s | HP: %d/%d | MP: %d/%d\n"
             "Pos: (%.1f, %.1f, %.1f) | Zone: %d\n"
-            "Target: %d (HP: %d%%) %s\n"
+            "Target: %d (HP: %d/%d = %d%%) %s\n"
             "Entities: %zu | Loot: %zu",
             player.id, player.id == 0 ? " (detecting)" : "",
             player.hp, player.maxHp, player.mp, player.maxMp,
             player.x, player.y, player.z, player.zone,
-            targetId, targetHpPct, targetDead ? "[DEAD]" : "",
+            targetId, targetHp, targetMaxHp, targetHpPct,
+            targetDead ? "[DEAD]" : "",
             entities.size(), lootDrops.size());
     }
 

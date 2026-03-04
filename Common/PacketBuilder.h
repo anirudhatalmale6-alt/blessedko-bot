@@ -123,11 +123,16 @@ namespace KO {
     // ---- Common packet builders ----
 
     // Attack target
+    // BlessedKO SEND 0x08 = 10 bytes: [type:1][sub:1][target:2][extra:6]
+    // Observed: 01 01 81 29 6E 00 FE FF 00 00
     inline Packet BuildAttackPacket(uint16_t targetId) {
         Packet p(Opcode::WIZ_ATTACK);
         p.WriteByte(0x01);          // Attack type: normal
-        p.WriteByte(0x01);          // Result (success)
+        p.WriteByte(0x01);          // Sub-type
         p.WriteShort(targetId);     // Target ID
+        p.WriteShort(0x0000);       // Extra data (distance/angle)
+        p.WriteShort(0x0000);       // Extra data
+        p.WriteShort(0x0000);       // Extra data
         return p;
     }
 
@@ -166,6 +171,9 @@ namespace KO {
     }
 
     // Select target
+    // WARNING: BlessedKO 0x41 SEND uses [0x00][click_coord:float][0x00]
+    // NOT entity IDs! This function is kept for reference but should NOT
+    // be used for auto-targeting. Attack packets work without explicit select.
     inline Packet BuildSelectTarget(uint16_t targetId) {
         Packet p(Opcode::WIZ_SELECT_TARGET);
         p.WriteShort(targetId);

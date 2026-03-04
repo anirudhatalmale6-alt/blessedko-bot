@@ -90,12 +90,8 @@ namespace Bot {
 
     // ---- Actions ----
 
-    inline void DoSelectTarget(uint16_t id) {
-        KO::Packet pkt = KO::BuildSelectTarget(id);
-        if (SendKOPacket(pkt)) {
-            Log("Select target -> %d\n", id);
-        }
-    }
+    // NOTE: DoSelectTarget removed — BlessedKO 0x41 uses click coords, not entity IDs.
+    // Auto-target sets targetId directly and attacks; server responds with 0x17 TARGET_HP.
 
     inline void DoBasicAttack() {
         if (GameState::targetId == 0 || GameState::targetDead) return;
@@ -170,16 +166,20 @@ namespace Bot {
             }
 
             // Auto-target: find nearest mob if no target or target dead
+            // Skip SELECT_TARGET (0x41 uses click coords) — just set target and attack
             if (autoAttack && (GameState::targetId == 0 || GameState::targetDead)) {
-                GameState::Entity* nearest = nullptr;
-                {
-                    std::lock_guard<std::mutex> lock(GameState::mtx);
-                    nearest = GameState::FindNearest(50.0f, true);
-                }
+                std::lock_guard<std::mutex> lock(GameState::mtx);
+                GameState::Entity* nearest = GameState::FindNearest(50.0f, true);
                 if (nearest) {
-                    DoSelectTarget(nearest->id);
-                    Sleep(300); // Wait for server to acknowledge
-                    continue;  // Re-check on next loop iteration
+                    GameState::targetId = nearest->id;
+                    GameState::targetDead = false;
+                    GameState::targetHp = 0;
+                    GameState::targetMaxHp = 0;
+                    GameState::targetHpPct = 100;
+                    Log("Auto-target -> entity %d (dist %.1f)\n",
+                        nearest->id,
+                        GameState::Distance2D(GameState::player.x, GameState::player.z,
+                            nearest->x, nearest->z));
                 }
             }
 

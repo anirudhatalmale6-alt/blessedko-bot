@@ -112,7 +112,7 @@ void OnBypassClick() {
         return;
     }
 
-    BotUI::Log("[*] Bypassing KODefender (v2.2)...");
+    BotUI::Log("[*] Bypassing KODefender (v2.3)...");
 
     HMODULE hDefender = GetModuleHandleA("KODefender.dll");
     if (!hDefender) {
@@ -343,9 +343,9 @@ void BotThread() {
     BotUI::onShowOpcodesClick = OnShowOpcodesClick;
     BotUI::onResetClick = OnResetClick;
 
-    BotUI::Log("=== BlessedKO Bot v2.2 - Combat Ready ===");
-    BotUI::Log("Opcodes mapped + Auto-target + HP tracking");
-    BotUI::Log("==========================================");
+    BotUI::Log("=== BlessedKO Bot v2.3 - HP Fixed + Combat ===");
+    BotUI::Log("Fixed: HP tracking, target HP, attack format");
+    BotUI::Log("================================================");
     BotUI::Log("");
     BotUI::Log("Setup:");
     BotUI::Log("  1. Bypass Defender (clears debug flags)");
@@ -353,9 +353,10 @@ void BotThread() {
     BotUI::Log("  3. Walk around (position + ID auto-detect)");
     BotUI::Log("");
     BotUI::Log("Combat:");
-    BotUI::Log("  Auto Atk -> Start Bot = auto-target + attack");
-    BotUI::Log("  Auto Loot -> Start Bot = pick up drops");
-    BotUI::Log("  Game State = check HP/target/entities");
+    BotUI::Log("  1. Click a mob in-game (sets target via 0x17)");
+    BotUI::Log("  2. Click Game State to verify HP + Target");
+    BotUI::Log("  3. Start Bot = auto-attack + auto-loot");
+    BotUI::Log("  Bot auto-targets nearest mob when target dies");
     BotUI::Log("");
     BotUI::Log("[+] DLL stealth active (PEB unlink + PE erase)");
 
