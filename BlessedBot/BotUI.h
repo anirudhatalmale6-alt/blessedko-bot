@@ -176,7 +176,7 @@ namespace BotUI {
         hMainWnd = CreateWindowExA(
             WS_EX_TOPMOST,
             "BlessedBotWnd",
-            "BlessedKO Bot v2.1 - Isolation Ready",
+            "BlessedKO Bot v2.2 - Combat Ready",
             WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
             100, 100, 620, 640,
             nullptr, nullptr, hInst, nullptr

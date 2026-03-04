@@ -343,19 +343,19 @@ void BotThread() {
     BotUI::onShowOpcodesClick = OnShowOpcodesClick;
     BotUI::onResetClick = OnResetClick;
 
-    BotUI::Log("=== BlessedKO Bot v2.1 - Isolation Ready ===");
-    BotUI::Log("Player pos + ID detect + Opcode isolation");
+    BotUI::Log("=== BlessedKO Bot v2.2 - Combat Ready ===");
+    BotUI::Log("Opcodes mapped + Auto-target + HP tracking");
     BotUI::Log("==========================================");
     BotUI::Log("");
     BotUI::Log("Setup:");
     BotUI::Log("  1. Bypass Defender (clears debug flags)");
     BotUI::Log("  2. Hook Net (installs hooks + parser)");
-    BotUI::Log("  3. Walk around -> pos tracked + ID detected");
+    BotUI::Log("  3. Walk around (position + ID auto-detect)");
     BotUI::Log("");
-    BotUI::Log("Isolation test (find unknown opcodes):");
-    BotUI::Log("  1. Click Reset (clears counters)");
-    BotUI::Log("  2. Do ONE action in-game");
-    BotUI::Log("  3. Click Opcodes -> new opcode = that action");
+    BotUI::Log("Combat:");
+    BotUI::Log("  Auto Atk -> Start Bot = auto-target + attack");
+    BotUI::Log("  Auto Loot -> Start Bot = pick up drops");
+    BotUI::Log("  Game State = check HP/target/entities");
     BotUI::Log("");
     BotUI::Log("[+] DLL stealth active (PEB unlink + PE erase)");
 

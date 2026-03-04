@@ -225,25 +225,42 @@ namespace GameState {
             break;
 
         case KO::Opcode::WIZ_HP_CHANGE:
-            // Standard USKO 0x13 - likely different opcode on this server
+            // BlessedKO 0x38 - HP change (isolated by client testing)
             if (len >= 6) {
                 uint16_t id = d[0] | (d[1] << 8);
                 int32_t hp = d[2] | (d[3] << 8) | (d[4] << 16) | (d[5] << 24);
-                if (id == player.id || player.id == 0) {
+                // Try reading maxHp if packet is large enough
+                int32_t maxHp = (len >= 10) ?
+                    (int32_t)(d[6] | (d[7] << 8) | (d[8] << 16) | (d[9] << 24)) : 0;
+                if (id == player.id || (player.id != 0 && false)) {
                     player.hp = hp;
-                    if (hp > player.maxHp) player.maxHp = hp;
+                    if (maxHp > 0) player.maxHp = maxHp;
+                    else if (hp > player.maxHp) player.maxHp = hp;
+                    Log("HP: %d/%d (id=%d)\n", hp, player.maxHp, id);
+                }
+                // Also check if this is our ID (for auto-detection)
+                if (player.id == 0 && hp > 100) {
+                    // If we get an HP change for an entity with a reasonable HP,
+                    // it might be us. But we can't be sure without position matching.
+                    Log("HP_CHG for id=%d hp=%d (player not identified yet)\n", id, hp);
+                }
+                // Update entity HP if we know the entity
+                Entity* e = FindEntity(id);
+                if (e) {
+                    e->lastSeen = GetTickCount();
                 }
             }
             break;
 
         case KO::Opcode::WIZ_MSP_CHANGE:
-            // Standard USKO 0x14 - likely different opcode on this server
+            // USKO 0x14 - may be different on BlessedKO (unconfirmed)
             if (len >= 6) {
                 uint16_t id = d[0] | (d[1] << 8);
                 int32_t mp = d[2] | (d[3] << 8) | (d[4] << 16) | (d[5] << 24);
-                if (id == player.id || player.id == 0) {
+                if (id == player.id) {
                     player.mp = mp;
                     if (mp > player.maxMp) player.maxMp = mp;
+                    Log("MP: %d/%d\n", mp, player.maxMp);
                 }
             }
             break;

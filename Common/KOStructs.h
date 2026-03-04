@@ -20,19 +20,20 @@ namespace KO {
         constexpr DWORD WS_CONNECT  = 0x00C53608;  // wsock32.connect
     }
 
-    // ---- Packet Opcodes (USKO standard) ----
+    // ---- Packet Opcodes (BlessedKO v23xx) ----
+    // Remapped from USKO standard based on isolation testing
     namespace Opcode {
-        // Movement
+        // Movement (same as USKO)
         constexpr uint8_t WIZ_MOVE              = 0x06;
         constexpr uint8_t WIZ_ROTATE            = 0x07;
 
         // Combat
-        constexpr uint8_t WIZ_ATTACK            = 0x08;
-        constexpr uint8_t WIZ_MAGIC_PROCESS     = 0x2C;  // Skill cast
+        constexpr uint8_t WIZ_ATTACK            = 0x08;  // Confirmed SEND (same as USKO)
+        constexpr uint8_t WIZ_MAGIC_PROCESS     = 0x31;  // BlessedKO: unified skill/buff (USKO was 0x2C)
         constexpr uint8_t WIZ_MAGIC_CANCEL      = 0x2D;
 
         // Target
-        constexpr uint8_t WIZ_TARGET_HP         = 0x17;
+        constexpr uint8_t WIZ_TARGET_HP         = 0x17;  // Confirmed RECV (same as USKO)
 
         // Item / Loot
         constexpr uint8_t WIZ_ITEM_DROP         = 0x1A;
@@ -41,8 +42,8 @@ namespace KO {
 
         // Character info
         constexpr uint8_t WIZ_MYINFO            = 0x01;
-        constexpr uint8_t WIZ_HP_CHANGE         = 0x13;
-        constexpr uint8_t WIZ_MSP_CHANGE        = 0x14;
+        constexpr uint8_t WIZ_HP_CHANGE         = 0x38;  // BlessedKO (USKO was 0x13)
+        constexpr uint8_t WIZ_MSP_CHANGE        = 0x14;  // Unconfirmed - may be different
         constexpr uint8_t WIZ_EXP_CHANGE        = 0x15;
 
         // Party
@@ -58,11 +59,8 @@ namespace KO {
         // NPC interaction
         constexpr uint8_t WIZ_NPC_EVENT         = 0x1E;
 
-        // Buff
-        constexpr uint8_t WIZ_BUFF              = 0x31;
-
         // Selection
-        constexpr uint8_t WIZ_SELECT_TARGET     = 0x3A;
+        constexpr uint8_t WIZ_SELECT_TARGET     = 0x41;  // BlessedKO (USKO was 0x3A)
 
         // Death
         constexpr uint8_t WIZ_DEAD              = 0x12;
@@ -73,7 +71,7 @@ namespace KO {
 
         // BlessedKO v23xx confirmed opcodes
         constexpr uint8_t WIZ_NPC_INOUT         = 0x0B;  // Entity spawn/despawn
-        constexpr uint8_t WIZ_HEARTBEAT          = 0xE9;  // Custom keepalive
+        constexpr uint8_t WIZ_HEARTBEAT         = 0xE9;  // Custom keepalive
     }
 
     // ---- Skill cast sub-opcodes ----

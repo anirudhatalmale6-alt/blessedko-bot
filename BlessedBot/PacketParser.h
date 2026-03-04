@@ -143,10 +143,9 @@ namespace PacketParser {
         case KO::Opcode::WIZ_ITEM_USE:        return "ITEM_USE";
         case KO::Opcode::WIZ_WARP:            return "WARP";
         case KO::Opcode::WIZ_ZONE_CHANGE:     return "ZONE_CHG";
-        case KO::Opcode::WIZ_MAGIC_PROCESS:   return "SKILL";
+        case KO::Opcode::WIZ_MAGIC_PROCESS:   return "MAGIC";  // 0x31: unified skill/buff on BlessedKO
         case KO::Opcode::WIZ_MAGIC_CANCEL:    return "SKILL_CXL";
         case KO::Opcode::WIZ_PARTY:           return "PARTY";
-        case KO::Opcode::WIZ_BUFF:            return "BUFF";
         case KO::Opcode::WIZ_SELECT_TARGET:   return "SEL_TGT";
         case KO::Opcode::WIZ_RESURRECT:       return "RESURRECT";
         case KO::Opcode::WIZ_HEARTBEAT:       return "HEARTBEAT";
@@ -162,7 +161,7 @@ namespace PacketParser {
         case 0x2E: return "UNK_2E";
         case 0x33: return "UNK_33";
         case 0x3D: return "UNK_3D";
-        case 0x41: return "UNK_41";
+        // 0x41 is now WIZ_SELECT_TARGET (handled above)
         case 0x54: return "UNK_54";
         case 0x5B: return "UNK_5B";
         case 0x64: return "UNK_64";

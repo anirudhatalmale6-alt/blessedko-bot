@@ -90,6 +90,13 @@ namespace Bot {
 
     // ---- Actions ----
 
+    inline void DoSelectTarget(uint16_t id) {
+        KO::Packet pkt = KO::BuildSelectTarget(id);
+        if (SendKOPacket(pkt)) {
+            Log("Select target -> %d\n", id);
+        }
+    }
+
     inline void DoBasicAttack() {
         if (GameState::targetId == 0 || GameState::targetDead) return;
 
@@ -160,6 +167,20 @@ namespace Bot {
             // Auto-loot (highest priority)
             if (autoLoot && (now - lastLoot) > (DWORD)lootDelayMs) {
                 DoLootNearest();
+            }
+
+            // Auto-target: find nearest mob if no target or target dead
+            if (autoAttack && (GameState::targetId == 0 || GameState::targetDead)) {
+                GameState::Entity* nearest = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(GameState::mtx);
+                    nearest = GameState::FindNearest(50.0f, true);
+                }
+                if (nearest) {
+                    DoSelectTarget(nearest->id);
+                    Sleep(300); // Wait for server to acknowledge
+                    continue;  // Re-check on next loop iteration
+                }
             }
 
             // Auto-attack / skill
